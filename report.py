@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+from html import escape
 
 
 # No-dot extension -> language table, copied from src/extract.py so this module
@@ -97,9 +98,9 @@ def _locate_workdir(proj_dir):
     p = os.path.abspath(proj_dir)
     markers = ("trace", "bug_validation", "logic_verification_results")
     cand = os.path.join(p, "fm_agent")
-    if any(os.path.isdir(os.path.join(cand, m)) for m in markers):
+    if os.path.isfile(os.path.join(cand, "run.json")) or any(os.path.isdir(os.path.join(cand, m)) for m in markers):
         return cand
-    if any(os.path.isdir(os.path.join(p, m)) for m in markers):
+    if os.path.isfile(os.path.join(p, "run.json")) or any(os.path.isdir(os.path.join(p, m)) for m in markers):
         return p
     return cand  # directory may not exist yet; caller validates
 
@@ -1290,7 +1291,7 @@ def _embed_detail_full(work_dir, items):
     return items
 
 
-def _render_html(items, sources):
+def _render_html(items, sources, run_metadata=None):
     """Render a self-contained HTML page embedding items and source files."""
     ordered = sorted(
         items,
@@ -1316,6 +1317,12 @@ def _render_html(items, sources):
     # (which may contain __DATA__) is ever re-scanned as a substitution target.
     pre, _, mid = _HTML_TEMPLATE.partition("__DATA__")
     mid, _, post = mid.partition("__SOURCES__")
+    if run_metadata:
+        identity = f"Run: {run_metadata.get('run_id', 'unknown')} | HEAD: {run_metadata.get('git_head') or 'unknown'}"
+        if run_metadata.get("git_dirty"):
+            identity += " (uncommitted changes)"
+        pre = pre.replace("<div id=\"stats\"></div>",
+                          f"<p>{escape(identity)}</p><div id=\"stats\"></div>", 1)
     return pre + payload + mid + src_payload + post
 
 
@@ -1337,7 +1344,14 @@ def generate_report(work_dir):
     _attach_source_href(work_dir, items)
     _embed_detail_full(work_dir, items)
     sources = _embed_sources(work_dir, items)
-    html = _render_html(items, sources)
+    try:
+        with open(os.path.join(work_dir, "run.json"), encoding="utf-8") as file:
+            run_metadata = json.load(file)
+        if not isinstance(run_metadata, dict):
+            run_metadata = None
+    except (OSError, ValueError):
+        run_metadata = None
+    html = _render_html(items, sources, run_metadata)
 
     out = os.path.join(work_dir, "report.html")
     tmp = out + ".tmp"

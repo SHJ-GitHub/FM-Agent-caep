@@ -14,6 +14,7 @@ from src.generate_topdown_layers import (
 )
 from src.extract import EXT_TO_LANG, _function_spans, run_extraction
 from src.languages.codegraph import try_codegraph_init
+from src.run_workspace import ARCHIVE_DIRECTORY, archive_workspace, publish_workspace
 from src.file_utils import (
     _is_test_file,
     add_test_file_exemption,
@@ -123,17 +124,15 @@ def publish_entry_results(proj_dir: str) -> None:
     try:
         run_work_dir = os.path.join(_entry_run_dir, "fm_agent")
         original_work_dir = os.path.join(_original_proj_dir, "fm_agent")
-        ready_marker = os.path.join(run_work_dir, _READY_MARKER)
-        if os.path.isfile(ready_marker):
-            os.remove(ready_marker)
         mismatches = _count_mismatches(
             os.path.join(run_work_dir, "logic_verification_results"),
             all_bugs=_all_bugs,
         )
         if os.path.isdir(run_work_dir):
-            if os.path.isdir(original_work_dir):
-                shutil.rmtree(original_work_dir)
-            shutil.copytree(run_work_dir, original_work_dir, symlinks=True)
+            publish_workspace(run_work_dir, original_work_dir)
+            published_marker = os.path.join(original_work_dir, _READY_MARKER)
+            if os.path.isfile(published_marker):
+                os.remove(published_marker)
             print(f"[EntryPlugin] Copied generated fm_agent/ to {original_work_dir}.")
         shutil.rmtree(_entry_run_dir, ignore_errors=True)
         _entry_run_dir = None
@@ -358,19 +357,20 @@ def _trim_project_in_place(proj_dir, all_by_source, keep_by_source):
 # too, so a resumed run picks up where the prior one left off.
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = (".git",)
+_SKIP_DIRS = (".git", ARCHIVE_DIRECTORY)
 
 
 def _make_run_copy(proj_dir, run_dir):
-    """Copy proj_dir (everything except .git) into a fresh ``run_dir``.
+    """Copy proj_dir (except .git and archived runs) into a fresh ``run_dir``.
 
     Includes an existing ``fm_agent/`` workspace so a resumed pipeline finds the
     prior run's state. Any leftover run directory from an interrupted run is
-    discarded first: the pristine sources always live in proj_dir, so the copy
-    can be remade cleanly.
+    rebuilt first, preserving any interrupted analysis workspace in the original
+    project's archive directory before removing the stale source copy.
     """
     for stale in (run_dir, run_dir + ".tmp"):
         if os.path.exists(stale):
+            archive_workspace(os.path.join(stale, "fm_agent"), project_dir=proj_dir)
             shutil.rmtree(stale)
     tmp_dir = run_dir + ".tmp"
     shutil.copytree(
@@ -392,7 +392,7 @@ def _enumerate_source_files(proj_dir):
     """
     source_files = []
     for root, dirs, files in os.walk(proj_dir):
-        dirs[:] = [d for d in dirs if d not in ("fm_agent", ".git")]
+        dirs[:] = [d for d in dirs if d not in ("fm_agent", ".git", ARCHIVE_DIRECTORY)]
         for fname in files:
             src_rel = os.path.relpath(os.path.join(root, fname), proj_dir).replace(os.sep, "/")
             ext = fname.rsplit(".", 1)[-1] if "." in fname else ""
