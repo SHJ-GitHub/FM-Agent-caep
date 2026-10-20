@@ -1,13 +1,18 @@
 """Regression coverage for #243; all analysis/LLM stages are stubbed."""
 
 import contextlib
+import errno
 import io
 import json
 import os
 from pathlib import Path
 import runpy
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +32,7 @@ from src.run_workspace import (
     restore_workspace,
     validate_resume_source,
 )
+from src.verification import streaming_reasoner
 
 
 class InterruptedAnalysis(RuntimeError):
@@ -401,6 +407,200 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         self.assertEqual(artifacts(self.work), before)
         self.assertEqual(len(self.archives()), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory write permissions")
+    def test_real_permission_denial_preserves_current(self):
+        before = self.seed()
+        archive_root = self.project / ARCHIVE_DIRECTORY
+        archive_root.mkdir(mode=0o555)
+        self.addCleanup(archive_root.chmod, 0o755)
+        with self.assertRaises(PermissionError):
+            archive_workspace(self.work)
+        self.assertEqual(artifacts(self.work), before)
+        self.assertEqual(self.archives(), [])
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires Linux /dev/full")
+    def test_kernel_enospc_during_copy_preserves_both_runs(self):
+        before = self.seed()
+        source = self.root / "source"
+        write(source / "phases.json", '{"phases": []}')
+        original_source = artifacts(source)
+        copytree = shutil.copytree
+
+        def full_device_copy(src, dst):
+            # Exercise a real ENOSPC from the kernel without filling the disk.
+            with open("/dev/full", "wb", buffering=0) as file:
+                file.write(Path(src).read_bytes())
+
+        def copy_to_full(src, dst, **kwargs):
+            return copytree(src, dst, copy_function=full_device_copy, **kwargs)
+
+        with patch("src.run_workspace.shutil.copytree", side_effect=copy_to_full):
+            with self.assertRaises(shutil.Error) as error:
+                publish_workspace(source, self.work)
+        self.assertIn(os.strerror(errno.ENOSPC), str(error.exception))
+        self.assertEqual(artifacts(self.work), before)
+        self.assertEqual(artifacts(source), original_source)
+        self.assertEqual(self.archives(), [])
+        self.assertEqual(list(self.project.glob(".fm_agent_publish_*")), [])
+
+    def test_sigkill_between_archive_and_promotion_is_recoverable(self):
+        before = self.seed()
+        source = self.root / "source"
+        write(source / "phases.json", '{"phases": ["new"]}')
+        original_source = artifacts(source)
+        barrier = self.root / "archived"
+        script = '''
+import sys, time
+from pathlib import Path
+from src import run_workspace as workspace
+original = workspace.archive_workspace
+def archive_then_wait(path):
+    archived = original(path)
+    Path(sys.argv[3]).write_text(str(archived))
+    while True:
+        time.sleep(1)
+workspace.archive_workspace = archive_then_wait
+workspace.publish_workspace(sys.argv[1], sys.argv[2])
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", script, str(source), str(self.work), str(barrier)],
+            cwd=Path(main.__file__).parent, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not barrier.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(barrier.exists(), "child did not reach the publication barrier")
+            process.kill()
+            process.communicate(timeout=10)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
+        archive = Path(barrier.read_text())
+        self.assertFalse(self.work.exists())
+        self.assertEqual(artifacts(archive), before)
+        self.assertEqual(artifacts(source), original_source)
+        restore_workspace(archive, self.work)
+        self.assertEqual(artifacts(self.work), before)
+
+    def test_archive_id_collision_does_not_overwrite_evidence(self):
+        write(self.project / ARCHIVE_DIRECTORY / "collision/report.html", "older")
+        before = self.seed()
+        with patch("src.run_workspace._new_id", side_effect=["collision", "unique"]):
+            archive = archive_workspace(self.work)
+        self.assertEqual(archive.name, "unique")
+        self.assertEqual(artifacts(archive), before)
+        self.assertEqual((self.project / ARCHIVE_DIRECTORY / "collision/report.html").read_text(), "older")
+
+    def test_symlink_archive_root_cannot_redirect_evidence(self):
+        before = self.seed()
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        (self.project / ARCHIVE_DIRECTORY).symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            archive_workspace(self.work)
+        self.assertEqual(artifacts(self.work), before)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_cli_invalid_option_combinations_preserve_current(self):
+        before = self.seed()
+        source = self.root / "source"
+        self.seed(source)
+        options = [
+            ["--resume-from", str(source), "--resume"],
+            ["--resume-from", str(source), "--incremental", "intent.md"],
+            ["--resume-from", str(source), "--estimate"],
+            ["--resume-from", str(self.root / "missing")],
+            ["--only-spec", "--incremental", "intent.md"],
+        ]
+        for args in options:
+            with self.subTest(args=args), \
+                 patch("sys.argv", ["main.py", str(self.project), *args]), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    runpy.run_path(str(Path(main.__file__)), run_name="__main__")
+                self.assertEqual(error.exception.code, 2)
+                self.assertEqual(artifacts(self.work), before)
+                self.assertEqual(self.archives(), [])
+
+    def test_incremental_publication_success_and_failure(self):
+        for isolate in (False, True):
+            for fail in (False, True):
+                with self.subTest(isolate=isolate, fail=fail):
+                    self.project = self.root / f"incremental-{isolate}-{fail}"
+                    self.project.mkdir()
+                    self.work = self.project / "fm_agent"
+                    write(self.project / "main.c", "int main(void) { return 0; }")
+                    self.init_git()
+                    old_commit = self.git("rev-parse", "HEAD")
+                    self.seed()
+                    write(self.work / "version.log", old_commit + "\n")
+                    write(self.project / "main.c", "int main(void) { return 1; }")
+                    self.git("add", "main.c")
+                    self.git("commit", "-m", "new revision")
+                    current_commit = self.git("rev-parse", "HEAD")
+                    intent = self.project / "intent.md"
+                    write(intent, "Return one.")
+                    before = artifacts(self.work)
+
+                    def incremental(run_dir, intent_path, baseline, **kwargs):
+                        self.assertEqual(baseline, old_commit)
+                        self.assertEqual(intent_path, str(intent))
+                        self.assertEqual(artifacts(Path(run_dir) / "fm_agent"), before)
+                        write(Path(run_dir) / "fm_agent/incremental.txt", "progress")
+                        if fail:
+                            raise InterruptedAnalysis()
+
+                    args = ["main.py", str(self.project), "--incremental", str(intent)]
+                    if isolate:
+                        args.append("--isolate")
+                    with patch("sys.argv", args), \
+                         patch.dict(os.environ, {"FM_AGENT_RESUME": "0"}), \
+                         patch("src.env_check.run", return_value=True), \
+                         patch("src.incremental_reasoner.run_incremental_pipeline", side_effect=incremental):
+                        if fail:
+                            with self.assertRaises(InterruptedAnalysis):
+                                runpy.run_path(str(Path(main.__file__)), run_name="__main__")
+                        else:
+                            runpy.run_path(str(Path(main.__file__)), run_name="__main__")
+                    self.assertEqual((self.work / "incremental.txt").read_text(), "progress")
+                    expected = [old_commit] if fail else [old_commit, current_commit]
+                    self.assertEqual((self.work / "version.log").read_text().splitlines(), expected)
+                    if isolate:
+                        self.assertEqual(len(self.archives()), 1)
+                        self.assertEqual(artifacts(self.archives()[0]), before)
+
+    def test_incremental_without_baseline_preserves_previous_workspace(self):
+        self.init_git()
+        before = self.seed()
+        write(self.project / "intent.md", "Return one.")
+        self.run_cli_until_interrupted("--incremental", str(self.project / "intent.md"), "--isolate")
+        self.assertEqual(artifacts(self.archives()[0]), before)
+        self.assertFalse((self.work / "version.log").exists())
+
+    def test_environment_resume_preserves_run_identity(self):
+        self.init_git()
+        self.seed()
+        metadata = record_run_metadata(self.work, self.project)
+        with patch("sys.argv", ["main.py", str(self.project)]), \
+             patch.dict(os.environ, {"FM_AGENT_RESUME": "1"}), \
+             patch("src.env_check.run", return_value=True), \
+             patch("src.pipeline_setup._run_generate_phases", side_effect=InterruptedAnalysis):
+            with self.assertRaises(InterruptedAnalysis):
+                runpy.run_path(str(Path(main.__file__)), run_name="__main__")
+        self.assertEqual(json.loads((self.work / "run.json").read_text()), metadata)
+        self.assertEqual(self.archives(), [])
+
+    def test_reasoner_propagates_keyboard_interrupt_for_pipeline_finalization(self):
+        input_dir = self.work / "extracted_functions"
+        input_dir.mkdir(parents=True)
+        with patch("src.verification.time.sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                streaming_reasoner(str(input_dir), str(self.work / "results"), validate_bugs=False)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,9 @@ def prepare_entry_scope(proj_dir: str) -> None:
     )
     try_codegraph_init(proj_dir)
     _trim_project_in_place(proj_dir, all_by_source, keep_by_source)
+    # Resume reuses the index. Refresh it after trimming so removed functions
+    # cannot be extracted again from the pre-trim database.
+    try_codegraph_init(proj_dir, force=True)
     marker_path = os.path.join(proj_dir, "fm_agent", _READY_MARKER)
     with open(marker_path, "w", encoding="utf-8") as file:
         file.write("ready\n")
