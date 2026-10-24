@@ -238,9 +238,11 @@ uv run python main.py <proj_dir> --incremental intent.md --all-bugs
 若主结果为 `path/to/function.json`，all-bugs 候选会写在同一目录下，依次命名为 `path/to/function.bug-001.json`、`bug-002.json` 等。主结果通过 `bug_count` 和 `reasoning_complete` 记录候选数量及推理是否完整。续跑时，完整的主结果就是 reasoning 阶段的检查点，只补跑尚未产生终态结果的候选验证；若 reasoning 中途停止，则只清理并重跑该函数的中间候选和验证，不影响其他已完成函数。
 
 默认情况下，全新完整分析会先将整个旧 `fm_agent/` 移至
-`<proj_dir>/.fm_agent_runs/<UTC时间戳>_<唯一ID>/`，保留报告、trace、规约、
+`<proj_dir>.fm_agent_runs/<UTC时间戳>_<唯一ID>/`，保留报告、trace、规约、
 验证证据及续跑检查点。当前运行仍位于 `<proj_dir>/fm_agent/`，CLI 会输出
-当前路径和归档路径。归档失败时停止分析，保留原目录。历史归档不会自动删除，
+当前路径和归档路径。归档位于项目旁边，避免 CodeGraph 和项目 Agent 扫描旧代码及报告。
+旧位置 `<proj_dir>/.fm_agent_runs/` 中的归档会在分析前迁出，续跑和增量模式也会处理。
+归档失败时停止分析，保留原目录。历史归档不会自动删除，
 仅在你不再需要时自行显式删除。全新的 `--isolate` 和 `--entry-func` 运行也遵循
 这一规则；它们复制结果回原项目时同样会先保留旧工作区。
 
@@ -249,8 +251,8 @@ uv run python main.py <proj_dir> --incremental intent.md --all-bugs
 
 ```bash
 uv run python main.py <proj_dir> --resume
-uv run python main.py <proj_dir> --resume-from <proj_dir>/.fm_agent_runs/<归档ID>
-uv run python report.py <proj_dir>/.fm_agent_runs/<归档ID>
+uv run python main.py <proj_dir> --resume-from <proj_dir>.fm_agent_runs/<归档ID>
+uv run python report.py <proj_dir>.fm_agent_runs/<归档ID>
 ```
 
 恢复过程会复制所选归档、归档当前工作区，再从 `fm_agent/` 续跑；所选归档仍保留，

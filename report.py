@@ -369,22 +369,37 @@ def _match_span(spans, fn):
     return ""
 
 
+def _source_project_root(work_dir):
+    """Locate sources even when a workspace has moved to the external archive."""
+    try:
+        with open(os.path.join(work_dir, "run.json"), encoding="utf-8") as file:
+            metadata = json.load(file)
+        if isinstance(metadata, dict):
+            for key in ("analysis_dir", "project_dir"):
+                root = metadata.get(key)
+                if isinstance(root, str) and os.path.isdir(root):
+                    return root
+    except (OSError, ValueError):
+        pass
+    return os.path.dirname(os.path.abspath(work_dir))
+
+
 def _enrich_locations(work_dir, items):
     """Best-effort fill ``location`` from the codegraph index, when available.
 
     The codegraph database lives in the project root (``.codegraph/codegraph.db``),
-    found via ``CodeGraphExtractor.from_proj_dir`` (checks the workdir and its
-    parent). Any failure — missing db, unsupported language, unindexed file —
-    leaves ``location`` empty and the page renders "—".
+    found using the source directory recorded in run.json, or the workspace's
+    parent for older runs. Any failure — missing db, unsupported language,
+    unindexed file — leaves ``location`` empty and the page renders "—".
     """
     try:
         from src.languages.codegraph import CodeGraphExtractor
-        extractor = CodeGraphExtractor.from_proj_dir(work_dir)
+        extractor = CodeGraphExtractor.from_proj_dir(_source_project_root(work_dir))
     except Exception:
         return items
     if extractor is None:
         return items
-    proj_root = os.path.dirname(os.path.abspath(work_dir))
+    proj_root = _source_project_root(work_dir)
     for item in items:
         src = item.get("source_file") or ""
         fn = item.get("function_name") or ""
@@ -407,14 +422,11 @@ def _enrich_locations(work_dir, items):
 def _attach_source_href(work_dir, items):
     """Best-effort add ``source_href``: report.html → original source file.
 
-    report.html lives in ``work_dir``; the original source tree sits next to it
-    at the project root (``os.path.dirname(work_dir)``, the same heuristic
-    ``_enrich_locations`` uses). The href is a pure function of the paths — no
-    filesystem reads — so regeneration stays byte-deterministic, and the link
-    resolves whenever the project directory is found alongside the report.
+    Use the source directory recorded in run.json, falling back to the parent
+    for older runs. The link resolves while that source tree remains available.
     """
     work_dir_abs = os.path.abspath(work_dir)
-    proj_root = os.path.dirname(work_dir_abs)
+    proj_root = _source_project_root(work_dir)
     for item in items:
         src = item.get("source_file") or ""
         if not src or src.startswith("/") or ".." in src.split("/"):
@@ -1247,14 +1259,13 @@ setup();
 def _embed_sources(work_dir, items):
     """Embed the original source of every referenced file, deduplicated.
 
-    Reads the real source tree next to the workspace (the same heuristic
-    ``_attach_source_href`` uses) so the expanded view can show the function
-    under the report with GitHub-style syntax highlighting. Each unique
+    Reads the source tree located by ``_source_project_root`` so the expanded
+    view can show the function with GitHub-style syntax highlighting. Each unique
     ``source_file`` is read once; a missing or unreadable file is skipped (the
     page then shows a muted note). The read happens at generation time, so the
     output stays byte-deterministic as long as the sources are unchanged.
     """
-    proj_root = os.path.dirname(os.path.abspath(work_dir))
+    proj_root = _source_project_root(work_dir)
     sources = {}
     for item in items:
         src = item.get("source_file") or ""

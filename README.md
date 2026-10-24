@@ -315,9 +315,12 @@ through, FM-Agent clears that function's intermediate candidates and validations
 and reruns the function without disturbing completed functions.
 
 By default, a fresh full run moves the complete existing `fm_agent/` workspace to
-`<proj_dir>/.fm_agent_runs/<UTC-timestamp>_<unique-id>/` before starting. Reports,
+`<proj_dir>.fm_agent_runs/<UTC-timestamp>_<unique-id>/` before starting. Reports,
 traces, specifications, validation evidence, and checkpoints are retained. The
 current run remains at `<proj_dir>/fm_agent/`; both paths are printed on the CLI.
+Archives live beside the project so CodeGraph and project agents do not scan
+old code or reports. Legacy `<proj_dir>/.fm_agent_runs/` archives are moved to
+this location before analysis, including resume and incremental runs.
 If archiving fails, analysis stops and the original workspace is left intact.
 Archived runs are never automatically deleted; remove unwanted archive
 directories explicitly when you no longer need them. This also applies to fresh
@@ -330,8 +333,8 @@ earlier workspace with `--resume-from`:
 
 ```bash
 uv run python main.py <proj_dir> --resume
-uv run python main.py <proj_dir> --resume-from <proj_dir>/.fm_agent_runs/<archive-id>
-uv run python report.py <proj_dir>/.fm_agent_runs/<archive-id>
+uv run python main.py <proj_dir> --resume-from <proj_dir>.fm_agent_runs/<archive-id>
+uv run python report.py <proj_dir>.fm_agent_runs/<archive-id>
 ```
 
 Restoration copies the selected archive, archives the current workspace, then
