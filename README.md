@@ -314,19 +314,30 @@ validations that do not yet have a terminal result. If reasoning stopped partway
 through, FM-Agent clears that function's intermediate candidates and validations
 and reruns the function without disturbing completed functions.
 
-By default, a fresh full run moves the complete existing `fm_agent/` workspace to
+By default, a fresh full run moves the existing analysis artifacts in `fm_agent/` to
 `<proj_dir>.fm_agent_runs/<UTC-timestamp>_<unique-id>/` before starting. Reports,
 traces, specifications, validation evidence, and checkpoints are retained. The
 current run remains at `<proj_dir>/fm_agent/`; both paths are printed on the CLI.
 Archives live beside the project so CodeGraph and project agents do not scan
 old code or reports.
-Empty workspace directories are not archived; environment checks only create
-the workspace when saving an explicit warning-ignore preference.
+Empty workspaces and workspaces containing only `.env_check_memory` are not
+archived. This warning-ignore preference file stays in the current workspace
+across fresh runs; restoring an archive or copying results back also preserves
+the current preferences. Environment checks only create the workspace when
+saving an explicit warning-ignore preference.
 If archiving fails, analysis stops and the original workspace is left intact.
 Archived runs are never automatically deleted; remove unwanted archive
 directories explicitly when you no longer need them. This also applies to fresh
 `--isolate` and `--entry-func` runs; their result copy-back preserves the previous
 workspace before installing the new one.
+
+Archiving and result publication use same-filesystem renames. The project's
+parent directory must be writable, and the project, archive, and temporary
+publication directory must be on the same filesystem. A project that is itself
+a separate mount point may not meet this requirement; a failed operation
+preserves the existing results. Publication stages copies in
+`.<project-name>.fm_agent_publish_*/` beside the project, so remnants after a
+forced termination stay outside the analysis scope.
 
 Pass `--resume` (or set `FM_AGENT_RESUME=1`) to keep the current workspace and do
 only the remaining work. If you accidentally started a new run, restore the
@@ -345,6 +356,9 @@ restoring artifacts does not check out or revert source code. In particular, an
 all-bugs workspace requires `--all-bugs`; incompatible reasoning modes are
 rejected. `--resume-from` cannot be combined with `--resume`, `--incremental`, or
 `--estimate`.
+
+`--resume-from WORKSPACE` accepts absolute paths, relative paths, and `~`.
+Relative paths are resolved from the directory where the command is launched.
 
 New runs write `fm_agent/run.json` before analysis, recording a stable run ID,
 timestamp, project path, Git HEAD and whether the checkout has uncommitted

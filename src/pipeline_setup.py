@@ -1013,7 +1013,6 @@ def _run_generate_phases(proj_dir, work_dir, script_dir, is_incremental=False,
 
     fm_reminder = ("IMPORTANT: The fm_agent/ directory is NOT part of the project source code. "
                     "It is a workspace for storing your output files only. "
-                    "Do NOT browse outside the project for archived analysis results. "
                     "Do NOT include fm_agent/ paths in phases.json. "
                     "Do NOT modify any existing project files.")
     incremental_reminder = ("IMPORTANT: An existing fm_agent/phases.json from a previous run is already "
@@ -1216,7 +1215,6 @@ def _run_generate_domain_context(proj_dir, work_dir, script_dir, resume=False, w
 
     fm_reminder = ("IMPORTANT: The fm_agent/ directory is NOT part of the project source code. "
                     "It is a workspace for storing your output files only. "
-                    "Do NOT browse outside the project for archived analysis results. "
                     "Do NOT modify any existing project files.")
 
     for attempt in range(1, OPENCODE_MAX_RETRIES + 1):

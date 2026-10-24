@@ -14,6 +14,7 @@ from pathlib import Path
 
 ARCHIVE_SUFFIX = ".fm_agent_runs"
 RUN_METADATA = "run.json"
+ENV_CHECK_MEMORY = ".env_check_memory"
 
 
 def _new_id() -> str:
@@ -27,7 +28,7 @@ def archive_root(project_dir: str | Path) -> Path:
 
 
 def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = None) -> Path | None:
-    """Move the entire workspace to a unique project archive, or fail intact.
+    """Archive run artifacts, retaining warning preferences in the workspace.
 
     Require a rename on the same filesystem; never fall back to copy-and-delete
     if it fails. No existing archive is ever pruned or overwritten. project_dir
@@ -40,10 +41,13 @@ def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = 
         return None
     if not work_dir.is_dir():
         raise ValueError(f"Workspace is not a directory: {work_dir}")
-    # Preflight scaffolding is not a previous run. Remove only a truly empty
-    # directory, so publication can also promote its staged workspace here.
-    if not any(work_dir.iterdir()):
-        work_dir.rmdir()
+    memory = work_dir / ENV_CHECK_MEMORY
+    keep_memory = memory.is_file() and not memory.is_symlink()
+    # A preferences file alone is not a previous analysis. Other hidden files,
+    # including checkpoints, still count as run artifacts.
+    if not any(path.name != ENV_CHECK_MEMORY or not keep_memory for path in work_dir.iterdir()):
+        if not keep_memory:
+            work_dir.rmdir()
         return None
     archive_project = project_dir if project_dir else work_dir.parent
     root = archive_root(archive_project)
@@ -54,6 +58,17 @@ def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = 
     while destination.exists() or destination.is_symlink():
         destination = root / _new_id()
     work_dir.rename(destination)
+    if keep_memory:
+        created = False
+        try:
+            work_dir.mkdir()
+            created = True
+            (destination / ENV_CHECK_MEMORY).rename(memory)
+        except BaseException:
+            if created:
+                work_dir.rmdir()
+            destination.rename(work_dir)
+            raise
     print(f"[Pipeline] Previous run archived at: {destination}")
     return destination
 
@@ -79,20 +94,49 @@ def publish_workspace(source: str | Path, work_dir: str | Path) -> None:
     """Install a complete copy, archiving the current workspace first.
 
     A failed copy leaves the current workspace untouched. A failed promotion
-    restores it. The source (archive or isolated run) always remains available.
+    restores it. Current warning preferences take precedence over the incoming
+    copy. The source (archive or isolated run) always remains available.
     """
     source, work_dir = Path(source).absolute(), Path(work_dir).absolute()
     validate_resume_source(source, work_dir)
-    with tempfile.TemporaryDirectory(prefix=".fm_agent_publish_", dir=work_dir.parent) as staging:
-        staged = Path(staging) / "workspace"
+    project = work_dir.parent.resolve()
+    # A hard kill can leave staging behind; keep it outside the source tree.
+    staging = Path(tempfile.mkdtemp(
+        prefix=f".{project.name}.fm_agent_publish_", dir=project.parent
+    ))
+    retained = staging / "preferences"
+    try:
+        staged = staging / "workspace"
         shutil.copytree(source, staged, symlinks=True)
+        memory = work_dir / ENV_CHECK_MEMORY
+        if memory.is_file() and not memory.is_symlink():
+            staged_memory = staged / ENV_CHECK_MEMORY
+            # Do not follow an incoming symlink when replacing old preferences.
+            staged_memory.unlink(missing_ok=True)
+            shutil.copy2(memory, staged_memory)
         archived = archive_workspace(work_dir)
         try:
+            # Archiving may leave just the preferences file at the destination.
+            # Retain that directory until the replacement succeeds.
+            if work_dir.exists():
+                work_dir.rename(retained)
             staged.rename(work_dir)
         except BaseException:
             if archived is not None:
+                memory_dir = retained if retained.exists() else work_dir
+                if memory_dir.exists():
+                    (memory_dir / ENV_CHECK_MEMORY).rename(archived / ENV_CHECK_MEMORY)
+                    memory_dir.rmdir()
                 archived.rename(work_dir)
+            elif retained.exists():
+                retained.rename(work_dir)
             raise
+        if retained.exists():
+            shutil.rmtree(retained)
+    finally:
+        # If rollback itself failed, leave the retained preferences recoverable.
+        if not retained.exists():
+            shutil.rmtree(staging)
     print(f"[Pipeline] Current run: {work_dir}")
 
 
