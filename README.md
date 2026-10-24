@@ -321,6 +321,8 @@ current run remains at `<proj_dir>/fm_agent/`; both paths are printed on the CLI
 Archives live beside the project so CodeGraph and project agents do not scan
 old code or reports. Legacy `<proj_dir>/.fm_agent_runs/` archives are moved to
 this location before analysis, including resume and incremental runs.
+Empty workspace directories are not archived; environment checks only create
+the workspace when saving an explicit warning-ignore preference.
 If archiving fails, analysis stops and the original workspace is left intact.
 Archived runs are never automatically deleted; remove unwanted archive
 directories explicitly when you no longer need them. This also applies to fresh

@@ -65,6 +65,11 @@ def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = 
         return None
     if not work_dir.is_dir():
         raise ValueError(f"Workspace is not a directory: {work_dir}")
+    # Preflight scaffolding is not a previous run. Remove only a truly empty
+    # directory, so publication can also promote its staged workspace here.
+    if not any(work_dir.iterdir()):
+        work_dir.rmdir()
+        return None
     archive_project = project_dir if project_dir else work_dir.parent
     migrate_legacy_archives(archive_project)
     root = archive_root(archive_project)
