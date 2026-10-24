@@ -61,6 +61,7 @@ The [website](http://fm-agent.ai/) of FM-Agent provides an online service for re
 - [oh-my-openagent](https://www.npmjs.com/package/oh-my-openagent) plugin (installed via `bunx`)
 - [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) plugin — captures raw OpenCode LLM request/response traces (see [Structured Trace](#structured-trace))
 - An LLM API key for your provider (the examples use [OpenRouter](https://openrouter.ai/))
+- [Clang](https://clang.llvm.org/docs/UsersManual.html) — optional; used for more precise C/C++ call graphs when available, with per-function codegraph fallback for code Clang cannot analyze. FM-Agent reads `compile_commands.json` from the project root or `build/`; set `CLANG_COMPILE_COMMANDS` for another location.
 - [Erlang Language Platform (ELP)](https://whatsapp.github.io/erlang-language-platform/docs/get-started/) — optional; required only when analyzing Erlang projects
   - The Erlang integration has been tested on Ubuntu with Erlang/OTP 26 or newer; select an ELP release binary built for a compatible OTP version.
   - rebar3 3.24.0 or newer is required for ELP to auto-discover projects containing `rebar.config`.
@@ -95,10 +96,11 @@ TOML file, stores
 the API key in `.env` plus a private local key file for standalone OpenCode, and syncs the matching OpenCode provider entry in
 `~/.config/opencode/opencode.json` (or the platform-equivalent config path)
 without requiring you to hand-edit JSON.
-If you choose `auto`, `codex-cli`, or `claude-cli` in the wizard, it updates the
-backend in the active FM-Agent TOML file and clears stale non-secret LLM
-overrides from the project `.env`. Any model and effort values found there are
-first retained in the TOML; no API key or OpenCode provider setup is needed.
+If you choose `auto`, `codex-cli`, `claude-cli`, or `dsh`, the wizard asks for a
+model ID, saves the backend and selected model in the active FM-Agent TOML,
+and clears stale non-secret LLM overrides from `.env`, retaining effort in TOML.
+Codex and Claude use their own CLI authentication; DSH requires `DEEPSEEK_API_KEY`
+and optionally `DEEPSEEK_BASE_URL` for a gateway.
 
 If you prefer to edit files manually, put your API key in `.env` (gitignored,
 loaded automatically via python-dotenv); every other setting has a committed
@@ -139,7 +141,7 @@ pass. The command also supports `--name`, `--provider`, `--base-url`,
 the complete syntax. It warns when a legacy `.env` value would still override a
 requested TOML setting.
 
-Then, all of the above dependencies (except Ubuntu and Python) can be installed via the provided script:
+Then, the core dependencies above can be installed via the provided script. The optional Clang and Erlang toolchains are not installed by default:
 
 ```bash
 ./install.sh
@@ -211,15 +213,52 @@ uv run python main.py <proj_dir> [--resume] [--all-bugs] [--domain-knowledge FIL
 | `proj_dir`                  | Directory of codebase that you want to check correctness                                        |
 | `--resume`                  | Continue a previous, interrupted run instead of starting over                                   |
 | `--incremental INTENT_FILE` | Run in incremental mode. The value is the path to an intent file describing the goal of the modification. |
-| `--all-bugs`                | Continue reasoning after a mismatch and report every candidate. Full and incremental modes validate each candidate; entry mode does not run bug validation. |
+| `--all-bugs`                | Continue reasoning after a mismatch and report every candidate. Full and incremental modes validate each candidate. |
 | `--domain-knowledge FILE [FILE ...]` | Copy extra Markdown domain-knowledge files into the run and provide them to setup, spec generation, and bug validation agents. Alias: `--knowledge`; may be repeated. |
 | `--bug-validator FILE`       | Use a custom Markdown prompt for bug validation instead of the built-in `md/bug_validator.md`. |
 | `--isolate`                 | Run against an isolated git worktree snapshot of the project instead of the project directory itself. |
 | `--submodule PATH [PATH ...]` | Only process source code under one or more subdirectories of `proj_dir`. |
 | `--extra-edge FILE`         | Add supplemental caller-to-callee edges to the static call graph from a JSON file or directory. |
 | `--only-spec`               | Only generate behavioral specs; skip the reasoning and bug validation stages. Cannot be combined with `--incremental`. |
+| `--estimate`                | Scan scope and print a history-based time, LLM-call, token, and cost estimate without making LLM calls. |
+| `--plugin NAME`             | Load a pipeline plugin from `plugins/NAME/`. |
+| `--list-plugin`             | List valid pipeline plugins and exit. |
+
+### Pipeline plugins
+
+FM-Agent plugins can pass, replace, or modify each of the six pipeline stages
+through trusted Python hooks. Every hook uses the same signature:
+
+```python
+def hook(proj_dir: str) -> None:
+    ...
+```
+
+See [Pipeline Plugins](docs/plugins.md) for the plugin layout, JSON
+configuration, execution modes, lifecycle, and trust boundary.
 
 `proj_dir` must be a git repository.
+
+### Pre-run estimate
+
+Inspect the planned source scope before spending any model tokens:
+
+```bash
+uv run python main.py <proj_dir> --estimate
+uv run python main.py <proj_dir> --estimate --submodule src/core src/runtime
+```
+
+The preflight lists included and excluded directories, included/excluded source
+file counts, an approximate function count from local extraction, and the six
+analysis stages. When completed runs are available, it scales their actual
+duration, LLM-call count, token usage, and cost by the current function count
+(falling back to file count) and reports a range. Every projected value is
+labelled **ESTIMATE**; with no completed history it reports that the estimate is
+unavailable instead of inventing a number.
+
+Successful-run summaries are retained in `fm_agent/history.jsonl` across fresh
+runs. A normal run also generates `fm_agent/estimate.json` before its first LLM
+stage, so the live dashboard can show the same preflight alongside actual usage.
 
 To provide project-specific domain knowledge without editing FM-Agent's built-in prompts, pass one or more Markdown files:
 
@@ -253,21 +292,18 @@ uv run python main.py <proj_dir> --submodule src/core src/runtime
 uv run python main.py <proj_dir> --incremental intent.md --submodule src/core src/runtime
 ```
 
-`--submodule` paths must point to directories inside `proj_dir`. The option can be combined with `--resume`, `--isolate`, and `--incremental`, but not with `--entry-func`.
+`--submodule` paths must point to directories inside `proj_dir`. The option can be combined with `--resume`, `--isolate`, and `--incremental`.
 
-Use `--all-bugs` with full, incremental, or entry-point analysis:
+Use `--all-bugs` with full or incremental analysis:
 
 ```bash
 uv run python main.py <proj_dir> --all-bugs
 uv run python main.py <proj_dir> --incremental intent.md --all-bugs
-uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 ```
 
 The option is off by default. When enabled, FM-Agent continues through later
 reasoning checkpoints and writes one standard mismatch result per candidate.
-Full and incremental modes validate each candidate independently. Entry-point
-reasoning reports the candidates and their count but intentionally does not run
-bug validation.
+Full and incremental modes validate each candidate independently.
 
 For a result such as `path/to/function.json`, all-bugs candidates are written
 beside it as `path/to/function.bug-001.json`, `bug-002.json`, and so on. The
@@ -285,7 +321,7 @@ Use `--only-spec` to stop after generating behavioral specs, skipping the reason
 uv run python main.py <proj_dir> --only-spec
 ```
 
-Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full, entry-point-scoped, and incremental runs. The JSON shape is:
+Use `--extra-edge FILE` when the static parser cannot see an important call relationship, such as indirect syscall dispatch. Supplemental edges are applied to full and incremental runs. The JSON shape is:
 
 ```json
 {
@@ -324,10 +360,26 @@ If `fm_agent/version.log` does not exist (no previous run to compare against), F
 
 ### Live Dashboard
 
-FM-Agent ships a standalone real-time TUI dashboard ([dashboard.py](dashboard.py)) that visualizes a run as it progresses: per-stage progress, token usage and cost, prompt-cache hit rate, and bug-validation verdicts. It reads the trace files FM-Agent writes under `fm_agent/`, so run it in a second terminal while `main.py` is going:
+FM-Agent ships a standalone real-time TUI dashboard ([dashboard.py](dashboard.py)) that visualizes a run as it progresses: pre-run scope and estimates, per-stage progress, token usage and cost, prompt-cache hit rate, and bug-validation verdicts. It reads the trace files FM-Agent writes under `fm_agent/`, so run it in a second terminal while `main.py` is going:
 
 ```bash
 uv run python dashboard.py <proj_dir>
+```
+
+Alternatively, start it automatically from the main command; it monitors the
+current run's workspace (including isolated runs) and is stopped when the run
+finishes:
+
+```bash
+uv run python main.py <proj_dir> --dashboard
+```
+
+To generate and display only the pre-run estimate, without starting the
+pipeline or making LLM calls:
+
+```bash
+uv run python dashboard.py <proj_dir> --estimate
+uv run python dashboard.py <proj_dir> --estimate --submodule src/core src/runtime
 ```
 
 | Argument    | Description                                                  |
@@ -360,11 +412,38 @@ mode, the summary additionally reports pending candidates; a missing, corrupt,
 or non-terminal validation is pending instead of disappearing from the totals.
 Default-mode summary behavior is unchanged.
 
+#### Interactive Report Index (`fm_agent/report.html`)
+
+A single self-contained `report.html` is generated automatically at the end of
+every full pipeline run (spec-only mode included), aggregating both the bug
+validation results and the per-function logic verification results into one
+browseable page. It is rendered purely from the run artifacts — no LLM calls,
+no network, no extra dependencies.
+
+Each row shows the report title, a status badge, the source file (linked back
+to the original source), the function name, and a code location. The page
+supports:
+
+- **Search** across title, source file, function name, and code location
+- **Filter** by status (`confirmed_bug` / `potential_bug`)
+  and by source file
+  (collapsible path tree; checking a directory selects all files under it).
+- **Sort** by status, source file, or function name
+- **Expand / collapse** individual reports or all reports at once, plus a
+  reset button
+
+The page is written to `fm_agent/report.html`; open it in a browser. It can
+also be regenerated on demand from any existing run's artifacts with
+`uv run python report.py <proj_dir>` (or pass an `fm_agent/` workspace or an
+archived-workspace directory directly). The incremental pipeline
+(`--incremental`) does not run the auto-generation hook — regenerate the page
+manually with the same command.
+
 ## Important Notes
 
 1. FM-Agent will create an `fm_agent/` directory under your codebase directory. Make sure there is no name conflict.
 2. The markdown files under `md/` provide general instructions that guide the agent's reasoning process. Prefer `--domain-knowledge` for project-specific context such as invariants, protocols, encoding rules, and domain terminology. For project-specific bug-validation procedures, use `--bug-validator` instead of editing the built-in prompt; for example, a compiler-specific validator can instruct the agent to compare outputs against a reference implementation such as GCC.
-3. **Supported languages**: Rust, C, C++, Python, Java, Go, CUDA, JavaScript, TypeScript, ArkTS, Erlang. Erlang function extraction and call graphs require ELP; if ELP is unavailable, Erlang files are skipped with a warning.
+3. **Supported languages**: Rust, C, C++, Python, Java, Go, CUDA, JavaScript, TypeScript, ArkTS, Erlang. C/C++ call graphs use Clang where analysis succeeds and codegraph for the remaining functions. Erlang function extraction and call graphs require ELP; if ELP is unavailable, Erlang files are skipped with a warning.
 
 ## Citation
 

@@ -9,6 +9,7 @@ from .file_utils import (
     is_file_ready,
 )
 from .opencode_trace import function_id_from_result_path, run_opencode_traced
+from .specification import SOFTWARE_PROFILE, SpecificationProfile
 from .llm_client import build_llm_cli_command
 from .domain_knowledge import (
     format_domain_knowledge_bullets,
@@ -79,7 +80,9 @@ def streaming_reasoner(
     already_processed=None,
     resume=False,
     bug_validator_path=None,
+    validate_bugs=True,
     all_bugs=False,
+    specification: SpecificationProfile = SOFTWARE_PROFILE,
 ):
     """Continuously watch input_dir for ready files, verify them, and validate bugs."""
     if work_dir is None:
@@ -91,7 +94,7 @@ def streaming_reasoner(
     if file_list is not None:
         expected_files = set(
             os.path.join(input_dir, rel) for rel in file_list
-            if os.path.splitext(rel)[1] in EXT_TO_LANG
+            if os.path.splitext(rel)[1].lower() in EXT_TO_LANG
         )
     else:
         expected_files = None
@@ -111,7 +114,7 @@ def streaming_reasoner(
         num_functions = sum(
             1 for root, _, files in os.walk(input_dir)
             for fname in files
-            if os.path.splitext(fname)[1] in EXT_TO_LANG
+            if os.path.splitext(fname)[1].lower() in EXT_TO_LANG
         )
         print(f"Functions pending verification: {num_functions}")
 
@@ -123,12 +126,23 @@ def streaming_reasoner(
             reasoning_futures = {}
             validation_futures = {}
             submitted = set()
+            failed = set()  # files that raised unhandled errors; don't retry forever
+
+            def _submit_file(file_path, ext):
+                # Submit a ready file for reasoning/verification.
+                submitted.add(file_path)
+                language = EXT_TO_LANG.get(ext, "C")
+                future = executor.submit(
+                    _verify_single_file, file_path, input_dir, output_dir, language, work_dir, resume
+                )
+                reasoning_futures[future] = file_path
+                logging.info(f"Submitted: {file_path}")
 
             while True:
                 # Scan for new ready files
                 for root, _, files in os.walk(input_dir):
                     for fname in files:
-                        ext = os.path.splitext(fname)[1]
+                        ext = os.path.splitext(fname)[1].lower()
                         if ext not in EXT_TO_LANG:
                             continue
                         file_path = os.path.join(root, fname)
@@ -138,7 +152,9 @@ def streaming_reasoner(
                             continue
                         if file_path in submitted:
                             continue
-                        if not is_file_ready(file_path):
+                        if file_path in failed:
+                            continue
+                        if not is_file_ready(file_path, specification):
                             continue
 
                         # File is ready and not yet submitted or processed.
@@ -169,7 +185,8 @@ def streaming_reasoner(
                         rel_path = os.path.relpath(fpath, proj_dir) if proj_dir else os.path.relpath(fpath, input_dir)
                         # Submit bug validation for MISMATCH results; defer printing
                         if (
-                            verdict == "MISMATCH"
+                            validate_bugs
+                            and verdict == "MISMATCH"
                             and proj_dir is not None
                             and config.BUG_VALIDATION_MAX_RETRIES > 0
                         ):
@@ -207,6 +224,7 @@ def streaming_reasoner(
                             print(f"[{completed_count}/{num_functions}] {rel_path}: {label}")
                     except Exception as exc:
                         logging.error(f"Error verifying {fpath}: {exc}")
+                        failed.add(fpath)
 
                 # Collect completed validation futures (non-blocking)
                 val_done = [f for f in validation_futures if f.done()]
@@ -247,7 +265,7 @@ def streaming_reasoner(
                     except Exception as exc:
                         logging.error(f"Validation error for {fpath}: {exc}")
 
-                # Check if all expected files have been processed
+                # Check if all expected files have been processed successfully
                 all_reasoning_done = (
                     expected_files is not None
                     and processed >= expected_files
@@ -257,27 +275,69 @@ def streaming_reasoner(
                     logging.info("All files verified and validated. Done.")
                     break
 
+                # Terminal state: every expected file is either processed or failed.
+                # Report failures explicitly instead of claiming success.
+                all_terminal = (
+                    expected_files is not None
+                    and (processed | failed) >= expected_files
+                    and not reasoning_futures
+                    and not validation_futures
+                )
+                if all_terminal and failed:
+                    logging.error(
+                        f"All files finished, but {len(failed)} file(s) failed verification."
+                    )
+                    for ff in sorted(failed):
+                        rel_path = os.path.relpath(ff, proj_dir) if proj_dir else os.path.relpath(ff, input_dir)
+                        print(f"[failed] {rel_path}: verification error")
+                    break
+
                 # Detect if spec generation subprocesses exited before all files are ready
                 _all_procs = spec_procs if spec_procs else None
                 if _all_procs is not None and all(_spec_task_done(p) for p in _all_procs):
-                    unready = (expected_files or set()) - processed
-                    if unready and not reasoning_futures and not validation_futures:
+                    # Final scan: producers may have finished writing markers after the
+                    # last regular scan, so check remaining expected files once more.
+                    newly_ready = False
+                    for file_path in (expected_files or set()) - processed - submitted - failed:
+                        ext = os.path.splitext(file_path)[1].lower()
+                        if ext not in EXT_TO_LANG:
+                            continue
+                        if not is_file_ready(file_path, specification):
+                            continue
+                        _submit_file(file_path, ext)
+                        newly_ready = True
+                    if newly_ready:
+                        logging.info(
+                            "All spec producers done; rescan found newly ready files, submitting them."
+                        )
+                        continue
+
+                    unready = (expected_files or set()) - processed - failed
+                    if not reasoning_futures and not validation_futures:
                         exit_codes = [_spec_task_exit_code(p) for p in _all_procs]
-                        if not processed:
-                            # No function got a spec at all – this is an error
-                            logging.warning(
-                                f"Spec generation process(es) exited (codes {exit_codes}) "
-                                f"but no .spec.json/.info.json sidecar pairs were created."
+                        if unready:
+                            if not processed:
+                                # No function got a spec at all – this is an error
+                                logging.warning(
+                                    f"Spec generation process(es) exited (codes {exit_codes}) "
+                                    f"but no .spec.json/.info.json sidecar pairs were created."
+                                )
+                            else:
+                                # Some functions are missing specs; leave them pending for retry.
+                                logging.warning(
+                                    f"Spec generation process(es) exited (codes {exit_codes}), "
+                                    f"{len(unready)} files missing specs, leaving them pending for retry."
+                                )
+                                for uf in sorted(unready):
+                                    rel_path = os.path.relpath(uf, proj_dir) if proj_dir else os.path.relpath(uf, input_dir)
+                                    print(f"[pending] {rel_path}: no spec yet; will retry")
+                        if failed:
+                            logging.error(
+                                f"{len(failed)} file(s) failed verification and will not be retried."
                             )
-                        else:
-                            # Some functions are missing specs; leave them pending for retry.
-                            logging.warning(
-                                f"Spec generation process(es) exited (codes {exit_codes}), "
-                                f"{len(unready)} files missing specs, leaving them pending for retry."
-                            )
-                            for uf in sorted(unready):
-                                rel_path = os.path.relpath(uf, proj_dir) if proj_dir else os.path.relpath(uf, input_dir)
-                                print(f"[pending] {rel_path}: no spec yet; will retry")
+                            for ff in sorted(failed):
+                                rel_path = os.path.relpath(ff, proj_dir) if proj_dir else os.path.relpath(ff, input_dir)
+                                print(f"[failed] {rel_path}: verification error")
                         break
 
                 time.sleep(poll_interval)
@@ -297,8 +357,8 @@ def streaming_reasoner(
                 logging.error(f"Error for {fpath}: {exc}")
         logging.info("Done.")
 
-    # Generate validation summary after all work is done
-    if proj_dir is not None:
+    # Generate a validation summary only when bug validation was enabled.
+    if proj_dir is not None and validate_bugs:
         if all_bugs:
             _generate_all_bugs_validation_summary(work_dir)
         else:
@@ -507,7 +567,7 @@ def _verify_single_file(file_path, input_dir, output_dir, language, work_dir=Non
         )
 
     try:
-        func, spec, knowledge = parse_input_function(file_path)
+        func, spec, knowledge = parse_input_function(file_path, language)
         if not spec:
             return file_path, "SKIPPED"
 

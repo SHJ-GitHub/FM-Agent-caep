@@ -15,6 +15,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+# `tools/chisel-circt/lib` contains tracked C++/CMake sources, not build output.
+!tools/chisel-circt/lib/
 lib64/
 parts/
 sdist/
@@ -218,5 +220,6 @@ docs/superpowers/
 
 .opencode/
 .codegraph/
+fm_agent_estimate/
 CLAUDE.md
 AGENTS.md

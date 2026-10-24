@@ -60,6 +60,7 @@ FM-Agent 的[官方网站](http://fm-agent.ai/)提供了在线代码库推理服
 - [oh-my-openagent](https://www.npmjs.com/package/oh-my-openagent) 插件（通过 `bunx` 安装）
 - [@lucentia/opencode-trace](https://www.npmjs.com/package/@lucentia/opencode-trace) 插件 —— 采集 OpenCode 原始 LLM 请求/响应 trace
 - 你所用 provider 的 LLM API 密钥（示例使用 [OpenRouter](https://openrouter.ai/)）
+- [Clang](https://clang.llvm.org/docs/UsersManual.html)——可选；可用时用于生成更准确的 C/C++ 调用图，Clang 无法分析的函数会逐函数回退到 codegraph。FM-Agent 会读取项目根目录或 `build/` 下的 `compile_commands.json`；其他位置可通过 `CLANG_COMPILE_COMMANDS` 指定。
 - [Erlang Language Platform（ELP）](https://whatsapp.github.io/erlang-language-platform/docs/get-started/)——可选，仅分析 Erlang 项目时需要
   - 本 Erlang 集成已在 Ubuntu 的 Erlang/OTP 26 或更高版本上验证；请选择基于兼容 OTP 版本构建的 ELP 发布包。
   - ELP 自动识别包含 `rebar.config` 的项目时，要求 rebar3 3.24.0 或更高版本。
@@ -90,7 +91,7 @@ uv run python src/configure_llm.py
 ```
 
 该向导会先展示预览、备份已有文件，然后更新当前生效的 FM-Agent TOML、把 API 密钥写入 `.env` 和供独立 OpenCode 使用的私有本地密钥文件，并同步对应的 OpenCode provider 到 `~/.config/opencode/opencode.json`（或当前平台上的等价路径），无需手写 JSON。
-若在向导中选择 `auto`、`codex-cli` 或 `claude-cli`，则会更新当前生效的 FM-Agent TOML 中的 backend，并清除项目 `.env` 里残留的非密钥 LLM 覆盖项；其中模型和 effort 的值会先迁移到 TOML。本地 CLI 使用自身认证，不需要 API 密钥或 OpenCode provider 配置。
+若在向导中选择 `auto`、`codex-cli`、`claude-cli` 或 `dsh`，则会询问模型 ID，将后端和所选模型写入当前生效的 FM-Agent TOML，并清除项目 `.env` 中残留的非密钥 LLM 覆盖项，保留 effort 到 TOML。Codex 和 Claude 使用各自 CLI 的认证；DSH 需要 `DEEPSEEK_API_KEY`，使用网关时再设置 `DEEPSEEK_BASE_URL`。
 
 如果你更希望手动编辑文件，可以复制模板：
 
@@ -114,7 +115,7 @@ uv run python src/configure_llm.py set --backend codex-cli
 
 该命令会预览并备份 `fm-agent.toml`，只修改命令中指定的配置项。它还支持 `--name`、`--provider`、`--base-url`、`--effort` 和 `--api-style`；完整语法见 [docs/config_llm.md](docs/config_llm.md)。若 `.env` 中仍有会覆盖本次 TOML 修改的旧值，命令会在写入前给出警告。
 
-上述所有依赖（Ubuntu 和 Python 除外）均可通过以下脚本一键安装：
+上述核心依赖可通过以下脚本一键安装；可选的 Clang 与 Erlang 工具链默认不安装：
 
 ```bash
 ./install.sh
@@ -160,15 +161,44 @@ uv run python main.py <proj_dir> [--resume] [--all-bugs] [--domain-knowledge FIL
 | `proj_dir` | 待检测代码库的目录路径 |
 | `--resume` | 续跑上一次中断的运行，而非从头开始 |
 | `--incremental INTENT_FILE` | 以增量模式运行，参数值为描述本次修改目标的意图文件路径。 |
-| `--all-bugs` | 在发现不匹配后继续推理并报告每个候选 Bug。完整和增量模式会逐个验证；入口函数模式不执行 Bug Validation。 |
+| `--all-bugs` | 在发现不匹配后继续推理并报告每个候选 Bug。完整和增量模式会逐个验证。 |
 | `--domain-knowledge FILE [FILE ...]` | 将额外的 Markdown 领域知识文件复制到本次运行中，并提供给 setup、规约生成和 Bug 验证 Agent。别名：`--knowledge`；可重复传入。 |
 | `--bug-validator FILE` | 使用自定义 Markdown 提示词执行 Bug 验证，替代内置的 `md/bug_validator.md`。 |
 | `--isolate` | 针对项目的隔离 git worktree 快照运行，而非直接在项目目录上运行。 |
 | `--submodule PATH [PATH ...]` | 只处理 `proj_dir` 中一个或多个子目录下的源代码。 |
 | `--extra-edge FILE` | 从 JSON 文件或目录向静态调用图补充 caller 到 callee 的边。 |
 | `--only-spec` | 只生成行为规约，跳过推理与 Bug 验证阶段。不能与 `--incremental` 一起使用。 |
+| `--estimate` | 不调用 LLM，仅扫描范围并输出基于历史数据的时间、LLM 调用次数、Token 与费用预估。 |
+| `--plugin NAME` | 加载 `plugins/NAME/` 下的 Pipeline 插件。 |
+| `--list-plugin` | 列出有效的 Pipeline 插件并退出。 |
+
+### Pipeline 插件
+
+FM-Agent 插件可以通过受信任的 Python Hook 跳过、替换或修改六个 Pipeline
+Stage。所有 Hook 使用统一签名：
+
+```python
+def hook(proj_dir: str) -> None:
+    ...
+```
+
+插件目录结构、JSON 配置、执行模式、生命周期和信任边界参见
+[Pipeline 插件](docs/plugins_zh.md)。
 
 `proj_dir` 必须是一个 git 仓库。
+
+### 运行前预估
+
+在消耗任何模型 Token 前检查计划分析的代码范围：
+
+```bash
+uv run python main.py <proj_dir> --estimate
+uv run python main.py <proj_dir> --estimate --submodule src/core src/runtime
+```
+
+预检会展示纳入和排除的目录、纳入/排除的源文件数量、通过本地抽取得到的近似函数数量，以及六个分析阶段。当存在已完成的历史运行时，FM-Agent 会按本次函数数量（缺失时退化为文件数量）缩放历史运行的实际耗时、LLM 调用次数、Token 用量和费用，并给出区间。所有预测值都会明确标注为 **ESTIMATE（估算）**；没有完整历史样本时会显示无法估算，而不会编造数值。
+
+成功运行的摘要会保存在 `fm_agent/history.jsonl`，并在全新运行清理工作目录时继续保留。正常运行也会在第一次 LLM 调用前生成 `fm_agent/estimate.json`，实时 Dashboard 会同时展示该预检和实际用量。
 
 如需在不修改 FM-Agent 内置提示词的情况下提供项目特定领域知识，可传入一个或多个 Markdown 文件：
 
@@ -193,17 +223,16 @@ uv run python main.py <proj_dir> --submodule src/core src/runtime
 uv run python main.py <proj_dir> --incremental intent.md --submodule src/core src/runtime
 ```
 
-`--submodule` 路径必须是 `proj_dir` 内部目录。该参数可与 `--resume`、`--isolate` 和 `--incremental` 一起使用，但不能与 `--entry-func` 一起使用。
+`--submodule` 路径必须是 `proj_dir` 内部目录。该参数可与 `--resume`、`--isolate` 和 `--incremental` 一起使用。
 
-`--all-bugs` 可用于完整、增量或入口函数分析：
+`--all-bugs` 可用于完整或增量分析：
 
 ```bash
 uv run python main.py <proj_dir> --all-bugs
 uv run python main.py <proj_dir> --incremental intent.md --all-bugs
-uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 ```
 
-该选项默认关闭。启用后，FM-Agent 会继续检查后续推理检查点，并为每个候选写出一个标准 mismatch 结果。完整和增量模式会分别验证每个候选；入口函数模式只报告候选及其数量，按设计不执行 Bug Validation。
+该选项默认关闭。启用后，FM-Agent 会继续检查后续推理检查点，并为每个候选写出一个标准 mismatch 结果。完整和增量模式会分别验证每个候选。
 
 若主结果为 `path/to/function.json`，all-bugs 候选会写在同一目录下，依次命名为 `path/to/function.bug-001.json`、`bug-002.json` 等。主结果通过 `bug_count` 和 `reasoning_complete` 记录候选数量及推理是否完整。续跑时，完整的主结果就是 reasoning 阶段的检查点，只补跑尚未产生终态结果的候选验证；若 reasoning 中途停止，则只清理并重跑该函数的中间候选和验证，不影响其他已完成函数。
 
@@ -215,7 +244,7 @@ uv run python main.py <proj_dir> --entry-func src::main --all-bugs
 uv run python main.py <proj_dir> --only-spec
 ```
 
-当静态解析无法看到关键调用关系时（例如间接 syscall 分发），可使用 `--extra-edge FILE`。补充边会同时作用于完整运行、入口函数范围运行和增量运行。JSON 格式如下：
+当静态解析无法看到关键调用关系时（例如间接 syscall 分发），可使用 `--extra-edge FILE`。补充边会同时作用于完整运行和增量运行。JSON 格式如下：
 
 ```json
 {
@@ -255,10 +284,23 @@ python3 main.py <proj_dir> --incremental <intent_file>
 
 ### 实时监控面板
 
-FM-Agent 自带一个独立的实时 TUI 监控面板（[dashboard.py](dashboard.py)），用于在运行过程中可视化展示：各阶段进度、Token 用量与花费、prompt 缓存命中率，以及 Bug 验证结果。它读取 FM-Agent 写入 `fm_agent/` 目录下的 trace 文件，因此可在 `main.py` 运行期间于另一个终端中启动：
+FM-Agent 自带一个独立的实时 TUI 监控面板（[dashboard.py](dashboard.py)），用于在运行过程中可视化展示：运行前范围与估算、各阶段进度、Token 用量与花费、prompt 缓存命中率，以及 Bug 验证结果。它读取 FM-Agent 写入 `fm_agent/` 目录下的 trace 文件，因此可在 `main.py` 运行期间于另一个终端中启动：
 
 ```bash
 uv run python dashboard.py <proj_dir>
+```
+
+也可以直接在主命令中启用，Dashboard 会自动关联本次运行的工作目录，并在流水线结束时退出：
+
+```bash
+uv run python main.py <proj_dir> --dashboard
+```
+
+如需在不启动流水线、不调用 LLM 的情况下生成并展示一次运行前估算：
+
+```bash
+uv run python dashboard.py <proj_dir> --estimate
+uv run python dashboard.py <proj_dir> --estimate --submodule src/core src/runtime
 ```
 
 | 参数 | 描述 |
@@ -287,6 +329,19 @@ FM-Agent 会在代码库目录下创建 `fm_agent/` 目录，主要输出内容�
 
 `fm_agent/bug_validation/` 目录下的 `summary.json` 文件汇总了所有 Bug 结果，包括报告的 Bug 总数、已确认 Bug 数、未确认 Bug 数。在 `--all-bugs` 模式下，汇总还会报告待验证候选；缺失、损坏或尚未进入终态的验证结果会显示为 `pending`，而不会从统计中消失。默认模式的汇总行为保持不变。
 
+#### 交互式报告索引（`fm_agent/report.html`）
+
+每次完整流水线运行结束后（包括仅生成规约的 `--only-spec` 模式），会自动生成一个自包含的 `report.html` 索引页，将 Bug 验证结果与逐函数逻辑验证结果汇总到同一页面。该页面完全由运行产物渲染而成——不调用 LLM、不联网、无额外依赖。
+
+每一行展示报告标题、状态徽章、源文件（可点击跳转到原始源码）、函数名与代码位置。页面支持：
+
+- **搜索**：按标题、源文件、函数名搜索
+- **筛选**：按状态（`confirmed_bug` / `potential_bug`）与源文件筛选
+- **排序**：按状态、源文件或函数名排序
+- **展开/折叠**：单个报告与全部报告一键展开/折叠，以及重置按钮
+
+页面写入 `fm_agent/report.html`，用浏览器打开即可浏览。也可随时基于任意已有运行的产物重新生成：`uv run python report.py <项目目录>`（也可直接传入 `fm_agent/` 工作目录或归档的工作区目录）。增量模式（`--incremental`）不会自动生成该页面，需手动运行上述命令。
+
 #### 日志文件（`fm_agent/fm_agent.log`）
 
 单一日志文件记录完整的流水线执行过程，包括文件提取进度、推理任务的提交与完成情况、网络错误与重试，以及最终的推理统计摘要。日志级别为 `INFO`，格式为 `%(asctime)s [%(levelname)s] %(message)s`。
@@ -295,7 +350,7 @@ FM-Agent 会在代码库目录下创建 `fm_agent/` 目录，主要输出内容�
 
 1. FM-Agent 会在代码库目录下创建 `fm_agent/` 目录，请确保不存在命名冲突。
 2. `md/` 目录下的 Markdown 文件提供了引导 Agent 推理过程的通用说明。针对项目特定的上下文（如不变量、协议、编码规则、领域术语），优先使用 `--domain-knowledge`。对于项目特定的 Bug 验证流程，请使用 `--bug-validator`，无需直接修改内置提示词；例如，编译器项目的自定义 validator 可以要求 Agent 将输出与 GCC 等参考实现进行对比。
-3. **支持的编程语言**：Rust、C、C++、Python、Java、Go、CUDA、JavaScript、TypeScript、ArkTS、Erlang。Erlang 的函数抽取与调用图需要 ELP；ELP 不可用时会给出警告并跳过 Erlang 文件。
+3. **支持的编程语言**：Rust、C、C++、Python、Java、Go、CUDA、JavaScript、TypeScript、ArkTS、Erlang。C/C++ 调用图对 Clang 分析成功的函数使用 Clang，其余函数使用 codegraph。Erlang 的函数抽取与调用图需要 ELP；ELP 不可用时会给出警告并跳过 Erlang 文件。
 
 ## 论文引用
 

@@ -144,6 +144,35 @@ LANG_CONFIG = {
         },
         "body": "brace",
     },
+    "chisel": {
+        "comment_prefix": "//",
+        "skip_prefixes": ("//", "/*", "*", "package", "import"),
+        "skip_keywords_line": (),
+        "keywords": {
+            "abstract", "case", "catch", "class", "def", "do", "else",
+            "extends", "final", "finally", "for", "if", "implicit",
+            "import", "lazy", "match", "new", "object", "override",
+            "package", "private", "protected", "return", "sealed",
+            "super", "this", "throw", "trait", "try", "type", "val",
+            "var", "while", "with", "yield",
+        },
+        "body": "external",
+    },
+    "verilog": {
+        "comment_prefix": "//",
+        "skip_prefixes": ("//", "/*", "*", "`"),
+        "skip_keywords_line": (),
+        "keywords": {
+            "always", "always_comb", "always_ff", "always_latch", "and",
+            "assign", "begin", "buf", "case", "do", "else", "end",
+            "endcase", "endfunction", "endgenerate", "endmodule",
+            "endpackage", "endtask", "for", "forever", "function",
+            "generate", "if", "initial", "module", "nand", "nor", "not",
+            "or", "package", "parameter", "primitive", "repeat", "task",
+            "wait", "while", "xnor", "xor",
+        },
+        "body": "external",
+    },
 }
 
 # Map file extensions to language keys
@@ -158,6 +187,8 @@ EXT_TO_LANG = {
     "js": "javascript", "jsx": "javascript",
     "cu": "cuda", "cuh": "cuda",
     "ets": "arkts",
+    "scala": "chisel", "sc": "chisel",
+    "v": "verilog", "sv": "verilog", "svh": "verilog",
 }
 
 # ---------------------------------------------------------------------------
@@ -176,6 +207,17 @@ def _safe_filename(name: str, ext: str) -> str:
     if not safe:
         safe = "_function"
     return f"{safe}.{ext}"
+
+
+def _function_output_path(out_dir: str, name: str, ext: str) -> str:
+    """Keep qualified identities while avoiding Windows ':' filenames."""
+    if sys.platform == "win32" and "::" in name:
+        parts = name.split("::")
+        return os.path.join(
+            out_dir, *[part.replace("/", "_") for part in parts[:-1]],
+            _safe_filename(parts[-1], ext),
+        )
+    return os.path.join(out_dir, _safe_filename(name, ext))
 
 
 def _strip_angle_brackets(text):
@@ -677,7 +719,7 @@ def _function_spans(filepath, lang_key, proj_dir=None):
 
 def run_extraction(
     proj_dir, work_dir=None, force=False, verbose=False,
-    return_unavailable_backends=False,
+    return_unavailable_backends=False, specification=None,
 ):
     """Run function extraction on a project directory.
 
@@ -687,7 +729,8 @@ def run_extraction(
 
     Returns (written_count, skipped_count). When
     ``return_unavailable_backends`` is true, appends the languages whose
-    semantic full-project extraction backend failed.
+    semantic full-project extraction backend failed. ``specification`` may
+    limit work to its already-registered language keys.
     """
     if work_dir is None:
         work_dir = proj_dir
@@ -699,7 +742,9 @@ def run_extraction(
         phases_data = json.load(f)
 
     registry_result = batch_extract_all(
-        proj_dir, include_unavailable=return_unavailable_backends
+        proj_dir,
+        include_unavailable=return_unavailable_backends,
+        specification=specification,
     )
     if return_unavailable_backends:
         registry_funcs, registry_langs, unavailable_backends = registry_result
@@ -720,6 +765,7 @@ def run_extraction(
     output_base = os.path.join(work_dir, "extracted_functions")
     written = 0
     skipped = 0
+    handled_empty = 0
     errors = []
 
     for src_rel in source_files:
@@ -735,10 +781,14 @@ def run_extraction(
             continue
 
         # Detect language from file extension
-        ext = src_rel.rsplit('.', 1)[-1] if '.' in src_rel else ''
+        ext = src_rel.rsplit('.', 1)[-1].lower() if '.' in src_rel else ''
         lang_key = EXT_TO_LANG.get(ext)
         if not lang_key:
             logging.warning(f"Unsupported file extension '.{ext}' for {src_rel}, skipping.")
+            continue
+        if specification is not None and not specification.allows_language(lang_key):
+            if verbose:
+                print(f"  SKIP (Profile language filter): {src_rel}")
             continue
 
         # Compute output directory: replace last dot in filename with hyphen
@@ -752,12 +802,17 @@ def run_extraction(
         out_dir = os.path.join(output_base, src_dir, dir_name) if src_dir else os.path.join(output_base, dir_name)
 
         registry_key = os.path.normcase(os.path.normpath(src_path))
-        if registry_key in registry_funcs:
+        handled_by_registry = registry_key in registry_funcs
+        if handled_by_registry:
             funcs = registry_funcs[registry_key]
         else:
             funcs = extract_functions_from_file(src_path, lang_key)
         if not funcs:
-            logging.warning(f"No functions extracted from {src_rel}")
+            if handled_by_registry:
+                handled_empty += 1
+                logging.info(f"No analysis units in handled source file {src_rel}")
+            else:
+                logging.warning(f"No functions extracted from {src_rel}")
             continue
 
         os.makedirs(out_dir, exist_ok=True)
@@ -770,20 +825,25 @@ def run_extraction(
             # already inside the filename yields "...-cpp::LocalStorage::Flush",
             # matching the call-edge FQNs. A bare name (free function, or the regex
             # fallback which cannot know classes) has no "::" and is written the same
-            # way. ":" is a legal filename character on Linux/macOS (this pipeline
-            # does not target Windows extraction). _safe_filename keeps the "::",
-            # maps "/" -> "_", and falls back to "_function" for empty names.
-            out_file = os.path.join(out_dir, _safe_filename(func_name, ext))
+            # way. Windows forbids ":" in filenames, so represent qualifiers as
+            # directories there: LocalStorage/Flush.ext yields the SAME FQN.
+            # Existing recursive phase collection handles both layouts.
+            out_file = _function_output_path(out_dir, func_name, ext)
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
-            # Skip only when the extracted file already has valid .spec.json and
-            # .info.json sidecars.
-            if not force and os.path.exists(out_file) and is_file_ready(out_file):
+            # Skip only when the extracted file already has both valid
+            # Profile-defined artifacts.
+            if (
+                not force
+                and os.path.exists(out_file)
+                and is_file_ready(out_file, specification)
+            ):
                 if verbose:
                     print(f"  SKIP (specced): {os.path.relpath(out_file, proj_dir)}")
                 skipped += 1
                 continue
 
-            with open(out_file, 'w') as f:
+            with open(out_file, 'w', encoding="utf-8") as f:
                 f.write(func_source)
             written += 1
             if verbose:
@@ -792,7 +852,10 @@ def run_extraction(
     print(f"Extraction complete: {written} written, {skipped} skipped.")
 
     if written == 0 and skipped == 0:
-        logging.error("Nothing was extracted — check phases.json source_files paths.")
+        if handled_empty:
+            logging.info(f"Extraction completed with {handled_empty} handled source file(s) containing no analysis units.")
+        else:
+            logging.error("Nothing was extracted — check phases.json source_files paths.")
         return (
             (written, skipped, unavailable_backends)
             if return_unavailable_backends else (written, skipped)
@@ -834,7 +897,7 @@ def _validate_extraction(extracted_dir, registry_langs=None):
     failures = []
     for root, _, files in os.walk(extracted_dir):
         for fname in files:
-            ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
+            ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
             lang_key = EXT_TO_LANG.get(ext)
             if not lang_key:
                 continue

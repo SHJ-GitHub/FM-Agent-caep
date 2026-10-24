@@ -5,10 +5,13 @@ Usage:
     uv run python dashboard.py <proj_dir>                        # live: <proj_dir>/fm_agent/
     uv run python dashboard.py <proj_dir>/fm_agent.archived_xx   # any workspace dir (auto-detected by trace/ subdir)
     uv run python dashboard.py <proj_dir> --refresh 1.0          # refresh every 1.0s
+    uv run python dashboard.py <proj_dir> --estimate             # one-shot pre-run estimate
 
 Reads:
+    <workdir>/estimate.json              (scope and history-based estimates)
     <workdir>/trace/events.jsonl          (FM-Agent native events)
     <workdir>/trace/opencode/*.jsonl      (lucentia opencode-trace records)
+    <workdir>/trace/dsh/**/session.v4.jsonl.zstd (DSH session usage)
     <workdir>/bug_validation/*.result.json (bug validation verdicts)
 
 Standalone — run in a second terminal while main.py is going.
@@ -38,6 +41,9 @@ from rich.table import Table
 from rich.text import Text
 from rich.progress_bar import ProgressBar
 from rich.align import Align
+
+from src.run_estimate import SCHEMA_VERSION, write_preflight_estimate
+from src.dsh_trace import DshTraceReader
 
 
 STAGES = ["init", "generate_phases_json", "generate_domain_context", "spec_generation", "verification", "bug_validation"]
@@ -180,28 +186,51 @@ def _locate_workdir(proj_dir):
     Accepts either:
       - A project root: dashboard looks for <root>/fm_agent/ (the live workspace).
       - A workspace directly (any name like fm_agent.opus_partial_*): detected
-        by the presence of a `trace/` subdir, used as-is.
+        by a `trace/` subdir or a valid FM-Agent estimate manifest, used as-is.
     """
     p = Path(proj_dir).resolve()
-    if (p / "trace").is_dir():
+    if (p / "trace").is_dir() or _has_preflight_manifest(p / "estimate.json"):
         return p
     return p / "fm_agent"
+
+
+def _has_preflight_manifest(path):
+    """Return whether path is an FM-Agent estimate manifest, not a namesake."""
+    try:
+        estimate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(estimate, dict)
+        and estimate.get("schema_version") == SCHEMA_VERSION
+        and isinstance(estimate.get("project"), str)
+        and isinstance(estimate.get("scope"), dict)
+        and isinstance(estimate.get("analysis_stages"), list)
+        and isinstance(estimate.get("estimate"), dict)
+    )
 
 
 class State:
     """Aggregated trace state. Mutated by tail_* methods on each refresh."""
 
-    def __init__(self, proj_dir):
+    def __init__(self, proj_dir, workdir=None, dsh_sessions=None):
         self.proj_dir = Path(proj_dir).resolve()
-        self.workdir = _locate_workdir(self.proj_dir)
+        self.workdir = (
+            Path(workdir).resolve()
+            if workdir is not None
+            else _locate_workdir(self.proj_dir)
+        )
         self.trace_dir = self.workdir / "trace"
         self.events_path = self.trace_dir / "events.jsonl"
         self.opencode_dir = self.trace_dir / "opencode"
+        self.dsh_trace = DshTraceReader(Path(dsh_sessions) if dsh_sessions is not None else self.trace_dir / "dsh")
         self.bug_dir = self.workdir / "bug_validation"
+        self.estimate_path = self.workdir / "estimate.json"
 
         # Tail offsets
         self._events_offset = 0
         self._opencode_offsets = {}      # filename → byte offset
+        self._estimate_mtime_ns = None
 
         # Aggregates
         self.first_event_time = None
@@ -214,9 +243,11 @@ class State:
         self.cache_window = deque(maxlen=CACHE_WINDOW)              # recent (cache_read, total_input) tuples
         self.llm_statuses = deque(maxlen=LLM_STATUS_WINDOW)         # recent LLM call status records
         self.recent_events = deque(maxlen=40)                       # (time, stage, status, summary)
-        self.opencode_token_totals = defaultdict(int)               # stage → tokens
-        self.opencode_cost = 0.0
-        self.opencode_calls = 0
+        self.agent_tokens = defaultdict(lambda: defaultdict(int))
+        self.agent_costs = defaultdict(float)
+        self.agent_calls = defaultdict(int)
+        self.agent_unknown_cost = set()
+        self.dsh_usage_complete = True
         self._opencode_requests = {}                                # (filename, id) → request metadata
 
         # Verification verdicts
@@ -228,6 +259,26 @@ class State:
         self.bugs_confirmed = 0
         self.bugs_not_confirmed = 0
         self.bugs_pending = 0     # opencode call done but no result.json yet
+        self.estimate = None
+        self.load_estimate()
+
+    def load_estimate(self):
+        """Load a newly created or refreshed pre-run estimate manifest."""
+        try:
+            mtime_ns = self.estimate_path.stat().st_mtime_ns
+        except OSError:
+            return
+        if mtime_ns == self._estimate_mtime_ns:
+            return
+        try:
+            with open(self.estimate_path, "r", encoding="utf-8") as f:
+                estimate = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(estimate, dict):
+            return
+        self.estimate = estimate
+        self._estimate_mtime_ns = mtime_ns
 
     # ---------- events.jsonl tail ----------
     def tail_events(self):
@@ -270,7 +321,7 @@ class State:
             if model and not self.model_seen:
                 self.model_seen = model
             usage = md.get("usage") or {}
-            if usage:
+            if usage and not usage.get("dsh_session_id"):
                 # Anthropic-native shape (from new llm_client)
                 inp = usage.get("input_tokens", 0) or 0
                 out = usage.get("output_tokens", 0) or 0
@@ -315,7 +366,11 @@ class State:
             )
 
         elif et == "opencode_call":
-            summary = ev.get("summary") or "opencode_call"
+            backend = ev.get("metadata", {}).get("backend", "opencode")
+            self.agent_calls.setdefault(backend, 0)
+            summary = ev.get("summary") or f"{backend} call"
+            if backend != "opencode":
+                summary = summary.replace("OpenCode", backend)
             self._push_recent(end or start, stage, status, summary)
 
     def _push_recent(self, ts, stage, status, summary):
@@ -438,7 +493,6 @@ class State:
             model=rec.get("model") or req.get("model"),
             code="200",
         )
-        self.opencode_calls += 1
         # DeepSeek (openai-compat) reports cache as flat top-level fields, and
         # prompt_tokens is the TOTAL (hit + miss). Split it into the disjoint
         # in:new / in:read the rest of the dashboard assumes — otherwise the
@@ -455,18 +509,51 @@ class State:
         cw = (usage.get("cache_creation_input_tokens")
               or usage.get("claude_cache_creation_5_m_tokens")
               or 0)
-        self.opencode_token_totals["input"] += inp
-        self.opencode_token_totals["output"] += out
-        self.opencode_token_totals["cache_read"] += cr
-        self.opencode_token_totals["cache_write"] += cw
-        model = rec.get("model")
-        self.opencode_cost += _cost_from_usage(model, {
+        model = rec.get("model") or req.get("model")
+        self._record_agent_usage("opencode", model, {
             "input_tokens": inp, "output_tokens": out,
             "cache_read_input_tokens": cr, "cache_creation_input_tokens": cw,
         })
+
+    def _record_agent_usage(self, backend, model, usage):
+        inp = usage.get("input_tokens", 0) or 0
+        out = usage.get("output_tokens", 0) or 0
+        cr = usage.get("cache_read_input_tokens", 0) or 0
+        cw = usage.get("cache_creation_input_tokens", 0) or 0
+        self.agent_calls[backend] += 1
+        totals = self.agent_tokens[backend]
+        for key, value in (("input", inp), ("output", out), ("cache_read", cr), ("cache_write", cw)):
+            totals[key] += value
+        if model and not self.model_seen:
+            self.model_seen = model
+        if _price_for(model):
+            self.agent_costs[backend] += _cost_from_usage(model, usage)
+        else:
+            self.agent_unknown_cost.add(backend)
         total_in = inp + cr + cw
         if total_in > 0:
             self.cache_window.append((cr, total_in))
+
+    def tail_dsh(self):
+        for record in self.dsh_trace.read_new():
+            self.dsh_usage_complete &= record["usage_complete"]
+            self._record_agent_usage("dsh", record["model"], record["usage"])
+            if not record["usage_complete"]:
+                self.agent_unknown_cost.add("dsh")
+            self._push_llm_status(
+                ts=record["time"], source="dsh", label=record["type"],
+                status="success" if record["usage_complete"] else "error", model=record["model"],
+                code="OK" if record["usage_complete"] else "USAGE_MISSING",
+            )
+
+    def total_tokens(self):
+        return {
+            key: self.totals.get(key, 0) + sum(tokens.get(key, 0) for tokens in self.agent_tokens.values())
+            for key in ("input", "output", "cache_read", "cache_write")
+        }
+
+    def total_cost(self):
+        return self.cost_native + sum(self.agent_costs.values())
 
     # ---------- bug_validation/*.result.json ----------
     def scan_bugs(self):
@@ -521,6 +608,113 @@ def render_header(state):
     return Panel(Text.from_markup("  •  ".join(parts)), border_style="cyan")
 
 
+def _fmt_range(value, formatter):
+    if not isinstance(value, dict):
+        return "history unavailable"
+    return f"{formatter(value.get('low'))} – {formatter(value.get('high'))}"
+
+
+def _directory_summary(directories, limit=3):
+    values = []
+    for item in directories or []:
+        values.append(item.get("path", "") if isinstance(item, dict) else str(item))
+    values = [value for value in values if value]
+    if not values:
+        return "(none)"
+    shown = ", ".join(values[:limit])
+    if len(values) > limit:
+        shown += f", … +{len(values) - limit}"
+    return shown
+
+
+def render_preflight(state):
+    estimate = state.estimate
+    if not estimate:
+        return Panel(
+            Align.center(
+                Text.from_markup(
+                    "[dim](no pre-run estimate; run main.py <proj> --estimate)[/]"
+                ),
+                vertical="middle",
+            ),
+            title="Pre-run Scope & ESTIMATE",
+            border_style="magenta",
+        )
+
+    scope = estimate.get("scope") or {}
+    prediction = estimate.get("estimate") or {}
+    scope_table = Table(show_header=False, expand=True, pad_edge=False, box=None)
+    scope_table.add_column("item", style="cyan", no_wrap=True)
+    scope_table.add_column("value", overflow="ellipsis")
+    scope_table.add_row(
+        "included dirs",
+        _directory_summary(scope.get("included_directories")),
+    )
+    scope_table.add_row(
+        "excluded dirs",
+        _directory_summary(scope.get("excluded_directories")),
+    )
+    scope_table.add_row(
+        "source files",
+        f"[green]{scope.get('included_file_count', 0)} included[/] / "
+        f"[dim]{scope.get('excluded_file_count', 0)} excluded[/]",
+    )
+    uncounted_count = len(scope.get("function_count_uncounted_files") or [])
+    function_suffix = " [dim](local estimate)[/]" if scope.get(
+        "function_count_is_estimate"
+    ) else ""
+    function_summary = f"[bold]~{scope.get('function_count', 0)}[/]"
+    if uncounted_count:
+        function_summary += (
+            f" [yellow]+ {uncounted_count} source file(s) requiring "
+            "semantic extraction[/]"
+        )
+    scope_table.add_row(
+        "functions",
+        f"{function_summary}{function_suffix}",
+    )
+    stage_labels = [
+        f"{stage.get('number')}. {stage.get('name')} ({stage.get('kind')})"
+        for stage in estimate.get("analysis_stages") or []
+    ]
+    scope_table.add_row("analysis stages", " → ".join(stage_labels))
+
+    prediction_table = Table(show_header=False, expand=True, pad_edge=False, box=None)
+    prediction_table.add_column("metric", style="magenta", no_wrap=True)
+    prediction_table.add_column("ESTIMATE", justify="right", style="bold")
+    prediction_table.add_row(
+        "time",
+        _fmt_range(prediction.get("duration_seconds"), _fmt_duration),
+    )
+    prediction_table.add_row(
+        "LLM calls",
+        _fmt_range(prediction.get("llm_calls"), lambda value: str(int(value))),
+    )
+    prediction_table.add_row(
+        "tokens",
+        _fmt_range(prediction.get("tokens"), _fmt_tokens),
+    )
+    prediction_table.add_row(
+        "cost",
+        _fmt_range(prediction.get("cost_usd"), _fmt_cost),
+    )
+    prediction_table.add_row(
+        "basis",
+        f"{prediction.get('based_on_runs', 0)} completed historical run(s)",
+    )
+
+    content = Table.grid(expand=True, padding=(0, 2))
+    content.add_column(ratio=3)
+    content.add_column(ratio=2)
+    content.add_row(scope_table, prediction_table)
+    return Panel(
+        content,
+        title="[bold magenta]Pre-run Scope & ESTIMATE[/]",
+        subtitle="[dim]ranges are estimates, not quotas[/]",
+        border_style="magenta",
+    )
+
+
 def render_stages(state):
     table = Table(show_header=True, header_style="bold", expand=True, pad_edge=False)
     table.add_column("Stage", style="cyan", no_wrap=True)
@@ -560,13 +754,16 @@ def render_tokens(state):
         ]
 
     table.add_row(*row("verification", state.totals), _fmt_cost(state.cost_native))
-    table.add_row(
-        *row(f"opencode ({state.opencode_calls})", state.opencode_token_totals),
-        _fmt_cost(state.opencode_cost),
-    )
-    # TOTAL — sum across both sources; also expose total input in the label
-    sums = {k: state.totals.get(k, 0) + state.opencode_token_totals.get(k, 0)
-            for k in ("input", "cache_read", "cache_write", "output")}
+    for backend in sorted(state.agent_calls):
+        cost = None if backend in state.agent_unknown_cost else state.agent_costs[backend]
+        label = f"{backend} ({state.agent_calls[backend]})"
+        if backend == "dsh" and not state.dsh_usage_complete:
+            label += " ≥ (usage incomplete)"
+        table.add_row(
+            *row(label, state.agent_tokens[backend]),
+            _fmt_cost(cost),
+        )
+    sums = state.total_tokens()
     in_total = sums["input"] + sums["cache_read"] + sums["cache_write"]
     table.add_row(
         f"[bold]TOTAL[/] [dim](in={_fmt_tokens(in_total)})[/]",
@@ -574,9 +771,9 @@ def render_tokens(state):
         _fmt_tokens(sums["cache_read"]),
         _fmt_tokens(sums["cache_write"]),
         _fmt_tokens(sums["output"]),
-        f"[bold]{_fmt_cost(state.cost_native + state.opencode_cost)}[/]",
+        f"[bold]{'≥' if state.agent_unknown_cost else ''}{_fmt_cost(state.total_cost())}[/]",
     )
-    return Panel(table, title="Tokens & Cost", border_style="green")
+    return Panel(table, title="Tokens & Estimated Cost", border_style="green")
 
 
 def render_cache(state):
@@ -594,13 +791,9 @@ def render_cache(state):
             f"[dim]{_fmt_tokens(cr)} / {_fmt_tokens(tot)}[/]"
         )
 
-    n_cr = state.totals.get("cache_read", 0)
-    n_in = state.totals.get("input", 0) + state.totals.get("cache_write", 0)
-    o_cr = state.opencode_token_totals.get("cache_read", 0)
-    o_in = (state.opencode_token_totals.get("input", 0)
-            + state.opencode_token_totals.get("cache_write", 0))
-    total_cr = n_cr + o_cr
-    total_input = n_in + o_in
+    totals = state.total_tokens()
+    total_cr = totals["cache_read"]
+    total_input = totals["input"] + totals["cache_write"]
     rows = list(state.cache_window)
 
     lines = [
@@ -618,7 +811,7 @@ def render_cache(state):
         cr_per = p.get("cache_read_input_token_cost") or 0
         if in_per > 0 and total_cr > 0:
             saved = total_cr * (in_per - cr_per)
-            actual = state.cost_native + state.opencode_cost
+            actual = state.total_cost()
             if saved > 0:
                 pct = saved / (actual + saved) * 100 if actual + saved > 0 else 0
                 lines.append(
@@ -718,6 +911,7 @@ def build_layout(state):
     layout = Layout()
     layout.split_column(
         Layout(render_header(state), name="header", size=3),
+        Layout(render_preflight(state), name="preflight", size=10),
         Layout(name="top", size=stages_h),
         Layout(name="mid", size=tokens_h),
         Layout(render_recent(state), name="footer"),
@@ -743,10 +937,40 @@ def main():
                     help=("Either a target codebase (monitors <proj_dir>/fm_agent/) "
                           "or a workspace directly (any dir containing a trace/ subdir)"))
     ap.add_argument("--refresh", type=float, default=1.5, help="Refresh seconds (default 1.5)")
+    ap.add_argument(
+        "--dsh-sessions", type=Path,
+        help="DSH session directory for this run, when stored outside the workspace",
+    )
+    ap.add_argument(
+        "--estimate",
+        action="store_true",
+        help="generate and display a one-shot pre-run estimate without LLM calls",
+    )
+    ap.add_argument(
+        "--submodule",
+        metavar="PATH",
+        nargs="+",
+        default=None,
+        help="limit estimate scope to project-relative subdirectories",
+    )
     args = ap.parse_args()
 
-    state = State(args.proj_dir)
-    if not state.trace_dir.exists():
+    estimate_workdir = None
+    if args.estimate:
+        project_dir = Path(args.proj_dir).resolve()
+        estimate_workdir = project_dir / "fm_agent_estimate"
+        write_preflight_estimate(
+            str(project_dir),
+            estimate_workdir,
+            submodules=args.submodule,
+        )
+
+    state = State(args.proj_dir, workdir=estimate_workdir, dsh_sessions=args.dsh_sessions)
+    if args.estimate:
+        Console().print(render_preflight(state))
+        return
+
+    if not state.trace_dir.exists() and not state.estimate_path.exists():
         print(f"trace dir not found: {state.trace_dir}", file=sys.stderr)
         print("Has the pipeline started yet? (waiting…)", file=sys.stderr)
 
@@ -755,8 +979,10 @@ def main():
               screen=True) as live:
         try:
             while True:
+                state.load_estimate()
                 state.tail_events()
                 state.tail_opencode()
+                state.tail_dsh()
                 state.scan_bugs()
                 live.update(build_layout(state))
                 time.sleep(args.refresh)

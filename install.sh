@@ -4,19 +4,29 @@ set -euo pipefail
 echo "=== fm-agent: installing required software ==="
 
 INSTALL_ERLANG_SUPPORT=0
+INSTALL_CHISEL_SUPPORT=0
+INSTALL_DSH=0
 for arg in "$@"; do
     case "$arg" in
+        --with-dsh)
+            INSTALL_DSH=1
+            ;;
         --with-erlang)
             INSTALL_ERLANG_SUPPORT=1
             ;;
+        --with-chisel)
+            INSTALL_CHISEL_SUPPORT=1
+            ;;
         -h|--help)
-            echo "Usage: ./install.sh [--with-erlang]"
+            echo "Usage: ./install.sh [--with-dsh] [--with-erlang] [--with-chisel]"
+            echo "  --with-dsh     Install DeepSeek Harness as the agent backend"
             echo "  --with-erlang  Install/verify Erlang/OTP 26+, rebar3 3.24.0+, and ELP"
+            echo "  --with-chisel  Install/verify CIRCT firtool and the FM-Agent Chisel pass plugin"
             exit 0
             ;;
         *)
             echo "[!!] unknown option: $arg"
-            echo "Usage: ./install.sh [--with-erlang]"
+            echo "Usage: ./install.sh [--with-dsh] [--with-erlang] [--with-chisel]"
             exit 1
             ;;
     esac
@@ -103,6 +113,9 @@ FM_AGENT_MODEL_BACKEND="$(printf '%s\n' "$_fmcfg" | sed -n 1p | tr '[:upper:]' '
 CODEGRAPH_REPO="$(printf '%s\n' "$_fmcfg" | sed -n 2p)"
 CODEGRAPH_VERSION="$(printf '%s\n' "$_fmcfg" | sed -n 3p)"
 codegraph_bin_dir="$(printf '%s\n' "$_fmcfg" | sed -n 4p)"
+if [[ "$INSTALL_DSH" -eq 1 ]]; then
+    FM_AGENT_MODEL_BACKEND=dsh
+fi
 
 # Decide whether to set up a local CLI backend or OpenCode. config.py keeps
 # `backend` a free string, so the installer still owns the allow-list of values
@@ -112,7 +125,7 @@ case "$FM_AGENT_MODEL_BACKEND" in
     ""|0|false|no|off|opencode|open-code)
         USE_LOCAL_CLI_BACKEND=0
         ;;
-    auto|codex|codex-cli|claude|claude-cli)
+    auto|codex|codex-cli|claude|claude-cli|dsh|deepseek-harness)
         USE_LOCAL_CLI_BACKEND=1
         ;;
     *)
@@ -131,7 +144,17 @@ fi
 
 if [[ "$USE_LOCAL_CLI_BACKEND" -eq 1 ]]; then
     echo "[ok] local CLI backend enabled: $FM_AGENT_MODEL_BACKEND"
-    if [[ "$FM_AGENT_MODEL_BACKEND" == "claude" || "$FM_AGENT_MODEL_BACKEND" == "claude-cli" ]]; then
+    if [[ "$FM_AGENT_MODEL_BACKEND" == "dsh" || "$FM_AGENT_MODEL_BACKEND" == "deepseek-harness" ]]; then
+        command -v node &>/dev/null && command -v npm &>/dev/null || {
+            echo "[!!] Node.js and npm are required for DeepSeek Harness."; exit 1;
+        }
+        if ! command -v dsh &>/dev/null; then
+            echo "[..] installing DeepSeek Harness"
+            npm install --global @deepseek-ai/dsh@0.2.0-rc.2
+        fi
+        echo "[ok] dsh found: $(dsh --version)"
+        dsh --profile headless --help >/dev/null
+    elif [[ "$FM_AGENT_MODEL_BACKEND" == "claude" || "$FM_AGENT_MODEL_BACKEND" == "claude-cli" ]]; then
         command -v claude &>/dev/null || { echo "[!!] claude CLI not found"; exit 1; }
         echo "[ok] claude found: $(claude --version 2>/dev/null || echo 'unknown version')"
     elif [[ "$FM_AGENT_MODEL_BACKEND" == "codex" || "$FM_AGENT_MODEL_BACKEND" == "codex-cli" ]]; then
@@ -171,24 +194,33 @@ else
 fi
 
 # ---------- codegraph (pinned via fm-agent.toml [codegraph]) ----------
-# repo/version/bin_dir were read from config.settings above (env > toml, already
-# ~-expanded); bump [codegraph].version in fm-agent.toml to switch. The pinned fork
-# build fixes an upstream C extraction bug that otherwise drops macro-decorated
-# functions. Empty only if explicitly cleared (e.g. CODEGRAPH_VERSION=""), which
-# can't be installed — treat as a hard error.
+# Provisioning lives in src/languages/codegraph.py; the runtime does it on demand,
+# so this just pre-warms the download rather than carrying a second copy of the
+# install logic. repo/version/bin_dir came from config.settings above; empty only
+# if explicitly cleared (e.g. CODEGRAPH_VERSION=""), which can't be installed.
 [ -n "$CODEGRAPH_REPO" ] && [ -n "$CODEGRAPH_VERSION" ] && [ -n "$codegraph_bin_dir" ] || {
     echo "[!!] [codegraph] repo/version/bin_dir not set in fm-agent.toml"; exit 1; }
 codegraph_want="${CODEGRAPH_VERSION#v}"
-if [ "$("$codegraph_bin_dir/codegraph" --version 2>/dev/null)" = "$codegraph_want" ]; then
-    echo "[ok] codegraph $codegraph_want already installed in $codegraph_bin_dir"
-else
-    echo "[..] installing codegraph $CODEGRAPH_VERSION from $CODEGRAPH_REPO"
-    curl -fsSL "https://raw.githubusercontent.com/$CODEGRAPH_REPO/main/install.sh" \
-      | CODEGRAPH_VERSION="$CODEGRAPH_VERSION" CODEGRAPH_BIN_DIR="$codegraph_bin_dir" sh
-    # Verify the pinned VERSION installed, not just that a binary exists: a bad
-    # version/network failure otherwise leaves a stale build in place silently.
-    [ "$("$codegraph_bin_dir/codegraph" --version 2>/dev/null)" = "$codegraph_want" ] \
-      || { echo "[!!] codegraph $codegraph_want install failed"; exit 1; }
+echo "[..] provisioning codegraph $CODEGRAPH_VERSION from $CODEGRAPH_REPO"
+uv run --no-sync python -c \
+  'from src.languages.codegraph import _codegraph_cmd; _codegraph_cmd()'
+# A second call, so this one's stdout is the path and nothing else.
+codegraph_bin="$(uv run --no-sync python -c \
+  'from src.languages.codegraph import _codegraph_cmd; print(_codegraph_cmd())')"
+# Verify the pinned VERSION, not just that a binary exists: a bad version or a
+# network failure otherwise leaves a stale build in place silently.
+[ "$("$codegraph_bin" --version 2>/dev/null)" = "$codegraph_want" ] \
+  || { echo "[!!] codegraph $codegraph_want install failed"; exit 1; }
+echo "[ok] codegraph $codegraph_want at $codegraph_bin"
+# A launcher on PATH for oh-my-openagent and for running `codegraph` by hand.
+# FM-Agent resolves its own, so this link is the user's to re-point; it targets the
+# bundle's launcher rather than a version directory, so it follows the pin by
+# itself. Skip it when the resolved binary already IS this launcher, which happens
+# when provisioning fell back to an external install of the pinned version:
+# `ln -sf X X` does not fail there — BSD ln unlinks the target first, leaving a
+# symlink to itself, and exits 0 where `set -e` never sees it.
+if [ ! "$codegraph_bin" -ef "$codegraph_bin_dir/codegraph" ]; then
+    mkdir -p "$codegraph_bin_dir" && ln -sf "$codegraph_bin" "$codegraph_bin_dir/codegraph"
 fi
 
 version_ge() {
@@ -249,6 +281,82 @@ print(max(candidates)[2])
     mkdir -p "$HOME/.local/bin"
     install -m 0755 "$elp_binary" "$HOME/.local/bin/elp"
     rm -rf "$temp_dir"
+    export PATH="$HOME/.local/bin:$PATH"
+}
+
+install_circt_and_chisel_tool() {
+    local circt_root circt_src circt_build tool_build parallel_jobs plugin_path
+    local circt_revision circt_commit
+    circt_root="${FM_AGENT_CIRCT_ROOT:-$HOME/.cache/fm-agent/circt}"
+    circt_src="$circt_root/src"
+    parallel_jobs="${FM_AGENT_CIRCT_JOBS:-1}"
+    circt_revision="${FM_AGENT_CIRCT_REVISION:-0dc3e50e63db2d502e6f97161592cb1032df55f4}"
+
+    command -v git &>/dev/null || { echo "[!!] git is required for CIRCT support"; exit 1; }
+    command -v cmake &>/dev/null || { echo "[!!] cmake is required for CIRCT support"; exit 1; }
+    command -v ninja &>/dev/null || { echo "[!!] ninja is required for CIRCT support"; exit 1; }
+    command -v c++ &>/dev/null || { echo "[!!] a C++ compiler is required for CIRCT support"; exit 1; }
+
+    mkdir -p "$circt_root"
+    if [[ ! -d "$circt_src/.git" ]]; then
+        echo "[..] initializing llvm/circt source cache"
+        mkdir -p "$circt_src"
+        git -C "$circt_src" init --quiet
+        git -C "$circt_src" remote add origin https://github.com/llvm/circt.git
+    else
+        echo "[ok] CIRCT source found: $circt_src"
+    fi
+
+    if ! git -C "$circt_src" cat-file -e "$circt_revision^{commit}" 2>/dev/null; then
+        echo "[..] fetching CIRCT revision $circt_revision"
+        git -C "$circt_src" fetch --depth 1 origin "$circt_revision"
+        circt_revision="$(git -C "$circt_src" rev-parse 'FETCH_HEAD^{commit}')"
+    fi
+    git -C "$circt_src" checkout --detach "$circt_revision"
+    git -C "$circt_src" submodule sync --recursive
+    git -C "$circt_src" submodule update --init --depth 1 --recursive
+    circt_commit="$(git -C "$circt_src" rev-parse HEAD)"
+    circt_build="$circt_root/build-${circt_commit:0:12}"
+    tool_build="$circt_root/fm-agent-chisel-build-${circt_commit:0:12}"
+    echo "[ok] CIRCT revision: $circt_commit"
+
+    if [[ ! -f "$circt_build/lib/cmake/circt/CIRCTConfig.cmake" ]]; then
+        echo "[..] configuring CIRCT"
+        cmake -G Ninja "$circt_src/llvm/llvm" -B "$circt_build" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_TARGETS_TO_BUILD=host \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DLLVM_EXTERNAL_PROJECTS=circt \
+            -DLLVM_EXTERNAL_CIRCT_SOURCE_DIR="$circt_src"
+    fi
+
+    if [[ ! -x "$circt_build/bin/firtool" ]]; then
+        echo "[..] building CIRCT firtool"
+        ninja -C "$circt_build" -j"$parallel_jobs" bin/firtool
+    fi
+
+    echo "[..] configuring FM-Agent Chisel CIRCT plugin"
+    cmake -G Ninja -S "$SCRIPT_DIR/tools/chisel-circt" -B "$tool_build" \
+        -DCIRCT_DIR="$circt_build/lib/cmake/circt" \
+        -DMLIR_DIR="$circt_build/lib/cmake/mlir" \
+        -DLLVM_DIR="$circt_build/lib/cmake/llvm"
+
+    echo "[..] building FM-Agent Chisel CIRCT plugin"
+    ninja -C "$tool_build" -j"$parallel_jobs" FMAgentChiselCirctPlugin
+
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
+    install -m 0755 "$circt_build/bin/firtool" "$HOME/.local/bin/firtool"
+    plugin_path="$(find "$tool_build" -type f \( \
+        -name 'libFMAgentChiselCirctPlugin.so' -o \
+        -name 'FMAgentChiselCirctPlugin.so' -o \
+        -name 'libFMAgentChiselCirctPlugin.dylib' -o \
+        -name 'FMAgentChiselCirctPlugin.dylib' \) -print -quit)"
+    [[ -n "$plugin_path" ]] || {
+        echo "[!!] Chisel CIRCT plugin build succeeded but no plugin library was found"
+        exit 1
+    }
+    install -m 0755 "$plugin_path" "$HOME/.local/lib/$(basename "$plugin_path")"
     export PATH="$HOME/.local/bin:$PATH"
 }
 
@@ -323,6 +431,14 @@ if [[ "$INSTALL_ERLANG_SUPPORT" -eq 1 ]]; then
     echo "[ok] Erlang/OTP $installed_otp"
     echo "[ok] rebar3 $installed_rebar"
     echo "[ok] $(elp version)"
+fi
+
+if [[ "$INSTALL_CHISEL_SUPPORT" -eq 1 ]]; then
+    echo "[..] installing/verifying optional Chisel/CIRCT support"
+    install_circt_and_chisel_tool
+    command -v firtool &>/dev/null || { echo "[!!] firtool was not installed"; exit 1; }
+    echo "[ok] firtool installed"
+    echo "[ok] FM-Agent Chisel CIRCT plugin installed"
 fi
 
 echo ""

@@ -1,9 +1,26 @@
 import json
 import os
 import re
+from pathlib import Path
+
+try:
+    from .languages.hardware import is_excluded_source_directory
+except ImportError:
+    # Keep helpers importable when an existing source-tree CLI is executed
+    # directly, for example ``python src/generate_batch_prompts.py``.
+    from languages.hardware import is_excluded_source_directory
 
 
 _METADATA_SIDECAR_SUFFIXES = (".spec.json", ".info.json")
+
+_GENERIC_SOURCE_SCAN_EXCLUDED_DIRECTORY_NAMES = frozenset({
+    "node_modules",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "fm_agent",
+})
+_HARDWARE_LANGUAGE_KEYS = frozenset({"chisel", "verilog"})
 
 _SPEC_FIELDS = {
     "signature",
@@ -41,8 +58,15 @@ _TERMINAL_VALIDATION_STRING_FIELDS = {
 }
 
 
-def _is_metadata_sidecar(file_path):
-    """Return whether file_path is a function metadata sidecar."""
+def _is_metadata_sidecar(file_path, specification=None):
+    """Return whether file_path is a function metadata sidecar.
+
+    ``specification`` is optional so the existing software callers keep their
+    exact behavior while the full Pipeline can use a Profile-owned artifact
+    pair.
+    """
+    if specification is not None:
+        return specification.is_artifact_path(file_path)
     return str(file_path).endswith(_METADATA_SIDECAR_SUFFIXES)
 
 
@@ -56,7 +80,21 @@ def _write_file_names(file_names, output_path):
     return file_names
 
 
-def collect_file_names(input_dir, output_path="file_list.json"):
+def _path_language(path):
+    """Return the registered language key for a source path, if known."""
+    from src.extract import EXT_TO_LANG  # local import avoids module cycles
+
+    extension = os.path.splitext(os.path.basename(path))[1].lstrip(".").lower()
+    return EXT_TO_LANG.get(extension)
+
+
+def _language_allowed(path, specification=None):
+    if specification is None or specification.languages is None:
+        return True
+    return specification.allows_language(_path_language(path))
+
+
+def collect_file_names(input_dir, output_path="file_list.json", specification=None):
     """Collect all file names under input_dir and write them to a JSON file.
 
     Each entry contains the relative path starting from input_dir.
@@ -64,7 +102,9 @@ def collect_file_names(input_dir, output_path="file_list.json"):
     file_names = []
     for root, _, files in os.walk(input_dir):
         for fname in files:
-            if _is_metadata_sidecar(fname):
+            if _is_metadata_sidecar(fname, specification):
+                continue
+            if not _language_allowed(fname, specification):
                 continue
             full_path = os.path.join(root, fname)
             rel_path = os.path.relpath(full_path, input_dir)
@@ -99,8 +139,16 @@ def _is_valid_info_json(data):
     return True
 
 
-def is_file_ready(file_path):
-    """Return whether both metadata sidecars contain valid new-format JSON."""
+def is_file_ready(file_path, specification=None):
+    """Return whether the active specification artifacts are ready.
+
+    With no Profile this preserves the historical strict software JSON
+    behavior.  A Profile owns the artifact names and validation strategy when
+    one is provided.
+    """
+    if specification is not None:
+        return specification.is_file_ready(file_path)
+
     spec_path = f"{file_path}.spec.json"
     info_path = f"{file_path}.info.json"
 
@@ -138,6 +186,14 @@ _TEST_FILE_PATTERNS = [
     re.compile(r'^.*\.test\.(?:ets)$'),    # ArkTS: foo.test.ets
     re.compile(r'^.*_(?:SUITE|tests?)\.erl$'),  # Erlang: Common Test / EUnit
 ]
+
+_CHISEL_TEST_STEM_PATTERN = re.compile(r"^.*(?:Spec|Test|Tester)$")
+_VERILOG_TEST_FILE_PATTERN = re.compile(
+    r"^(?:tb_.+|testbench(?:_.+)?|.+_(?:tb|test|testbench))"
+    r"\.(?:v|sv|svh)$",
+    re.IGNORECASE,
+)
+_VERILOG_TEST_DIR_NAMES = frozenset({"tb", "sim", "testbench"})
 
 
 # Project-relative paths that must never be treated as test files, even when
@@ -402,7 +458,7 @@ def _json_file_is_valid(path, retry_errors=False):
         return False
 
 
-def _get_phase_files(phases_data, phase_num, input_dir):
+def _get_phase_files(phases_data, phase_num, input_dir, specification=None):
     """Return relative paths of extracted function files for a given phase."""
     phase = next(p for p in phases_data["phases"] if p["phase"] == phase_num)
     phase_files = []
@@ -424,12 +480,16 @@ def _get_phase_files(phases_data, phase_num, input_dir):
                 for root, _dirs, fnames in os.walk(extracted_dir):
                     for fname in sorted(fnames):
                         fpath = os.path.join(root, fname)
-                        if os.path.isfile(fpath) and not _is_metadata_sidecar(fname):
+                        if (
+                            os.path.isfile(fpath)
+                            and not _is_metadata_sidecar(fname, specification)
+                            and _language_allowed(fname, specification)
+                        ):
                             phase_files.append(os.path.relpath(fpath, input_dir))
     return phase_files
 
 
-def _get_all_phase_files(phases_data, input_dir):
+def _get_all_phase_files(phases_data, input_dir, specification=None):
     """Return extracted function files reachable from all phases in phases.json."""
     phase_files = []
     seen = set()
@@ -437,7 +497,7 @@ def _get_all_phase_files(phases_data, input_dir):
         phase_num = phase_info.get("phase")
         if phase_num is None:
             continue
-        for rel in _get_phase_files(phases_data, phase_num, input_dir):
+        for rel in _get_phase_files(phases_data, phase_num, input_dir, specification):
             if rel not in seen:
                 seen.add(rel)
                 phase_files.append(rel)
@@ -454,10 +514,34 @@ def _is_under_submodules(rel_path, submodules):
     return any(norm == sub or norm.startswith(sub + "/") for sub in submodules)
 
 
-def _iter_project_source_files(proj_dir, submodules=None):
+def _uses_hardware_source_scan(specification):
+    """Return whether the active Profile is limited to hardware languages."""
+    if specification is None or specification.languages is None:
+        return False
+    languages = set(specification.languages)
+    return bool(languages) and languages <= _HARDWARE_LANGUAGE_KEYS
+
+
+def _is_excluded_project_source_directory(name, specification=None):
+    """Apply expanded pruning only to an explicitly hardware-only scan."""
+    if _uses_hardware_source_scan(specification):
+        return is_excluded_source_directory(name)
+    return (
+        name.startswith(".")
+        or name in _GENERIC_SOURCE_SCAN_EXCLUDED_DIRECTORY_NAMES
+    )
+
+
+def _iter_project_source_files(proj_dir, submodules=None, specification=None):
     """Yield project-relative source file paths, optionally limited to submodules."""
     from src.extract import EXT_TO_LANG  # local import to avoid circular import
     source_exts = set(EXT_TO_LANG.keys())
+    if specification is not None and specification.languages is not None:
+        source_exts = {
+            extension
+            for extension, language in EXT_TO_LANG.items()
+            if specification.allows_language(language)
+        }
     scan_roots = [proj_dir]
     if submodules:
         scan_roots = [
@@ -468,10 +552,13 @@ def _iter_project_source_files(proj_dir, submodules=None):
     for scan_root in scan_roots:
         for root, dirs, files in os.walk(scan_root):
             # Skip hidden dirs and common non-source dirs
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in
-                       {'node_modules', '__pycache__', 'venv', '.venv', 'fm_agent'}]
+            dirs[:] = [
+                directory
+                for directory in dirs
+                if not _is_excluded_project_source_directory(directory, specification)
+            ]
             for fname in files:
-                ext = fname.rsplit('.', 1)[-1] if '.' in fname else ''
+                ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
                 if ext not in source_exts:
                     continue
                 rel = os.path.relpath(os.path.join(root, fname), proj_dir)
@@ -497,6 +584,23 @@ def _is_test_file(rel_path):
     for part in parts[:-1]:
         if part.lower() in _TEST_DIR_NAMES:
             return True
+    extension = Path(parts[-1]).suffix.lower()
+    if extension in {".scala", ".sc"}:
+        lower_parts = [part.lower() for part in parts[:-1]]
+        in_main_source_tree = any(
+            lower_parts[index:index + 2] == ["src", "main"]
+            for index in range(len(lower_parts) - 1)
+        )
+        if in_main_source_tree:
+            return False
+        return bool(_CHISEL_TEST_STEM_PATTERN.fullmatch(Path(parts[-1]).stem))
+    if extension in {".v", ".sv", ".svh"}:
+        if any(
+            part.lower() in _VERILOG_TEST_DIR_NAMES
+            for part in parts[:-1]
+        ):
+            return True
+        return bool(_VERILOG_TEST_FILE_PATTERN.match(parts[-1]))
     # Check filename against test patterns
     basename = parts[-1]
     for pat in _TEST_FILE_PATTERNS:

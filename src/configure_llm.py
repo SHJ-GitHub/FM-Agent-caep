@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
@@ -47,8 +48,8 @@ class ConfigWizardError(RuntimeError):
 
 
 ApiStyle = Literal["openai", "anthropic"]
-_BACKENDS = ("opencode", "auto", "codex-cli", "claude-cli")
-_EFFORTS = ("", "low", "medium", "high")
+_BACKENDS = ("opencode", "auto", "codex-cli", "claude-cli", "dsh", "deepseek-harness")
+_EFFORTS = ("", "off", "low", "medium", "high", "max")
 _LLM_TOML_KEYS = ("name", "provider", "base_url", "backend", "effort", "api_style")
 _TOML_KEY_BY_ENV_KEY = {
     "LLM_API_BASE_URL": "base_url",
@@ -87,11 +88,41 @@ def adapter_for_api_style(api_style: ApiStyle) -> str:
     raise ConfigWizardError(f"Unsupported API style: {api_style}")
 
 
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _valid_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").rstrip(".")
+    except UnicodeError:
+        return False
+    if not ascii_hostname or len(ascii_hostname) > 253:
+        return False
+    return all(_HOST_LABEL_RE.fullmatch(label) for label in ascii_hostname.split("."))
+
+
 def validate_base_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        parsed.port  # Accessing .port validates non-numeric and out-of-range ports.
+    except ValueError as exc:
         raise ConfigWizardError(
-            f"Base URL must be an absolute http(s) URL, got: {url!r}"
+            f"Base URL must be an absolute http(s) URL with a valid hostname and port, got: {url!r}"
+        ) from exc
+    if (
+        parsed.scheme not in ("http", "https")
+        or not hostname
+        or not _valid_hostname(hostname)
+    ):
+        raise ConfigWizardError(
+            f"Base URL must be an absolute http(s) URL with a valid hostname and port, got: {url!r}"
         )
 
 
@@ -362,12 +393,19 @@ def merge_opencode_config(
 
 
 _SECTION_RE = re.compile(r"^\s*\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$")
-_KV_RE = re.compile(r"^(\s*)([A-Za-z0-9_]+)(\s*=\s*)(.*?)(\s*(#.*)?)$")
+_KV_RE = re.compile(
+    r'''^(\s*)([A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')(\s*=\s*)(.*?)(\s*(#.*)?)$'''
+)
 _ENV_EXPORT_PREFIX_RE = re.compile(r"^export[^\S\r\n]+")
 
 
 def _quote_toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_key_name(key_token: str) -> str:
+    """Decode one valid TOML bare or quoted key to its semantic name."""
+    return next(iter(tomllib.loads(f"{key_token} = 0").keys()))
 
 
 def update_llm_settings_toml_text(text: str, updates: dict[str, str]) -> str:
@@ -413,11 +451,15 @@ def update_llm_settings_toml_text(text: str, updates: dict[str, str]) -> str:
 
         if in_llm:
             kv_match = _KV_RE.match(line)
-            if kv_match and kv_match.group(2) in target:
+            if kv_match:
                 indent, key, sep, _old_value, trailer, _comment = kv_match.groups()
-                new_lines.append(f"{indent}{key}{sep}{target[key]}{trailer}\n")
-                seen_keys.add(key)
-                continue
+                semantic_key = _toml_key_name(key)
+                if semantic_key in target:
+                    new_lines.append(
+                        f"{indent}{key}{sep}{target[semantic_key]}{trailer}\n"
+                    )
+                    seen_keys.add(semantic_key)
+                    continue
         new_lines.append(line)
 
     if in_llm:
@@ -517,15 +559,17 @@ def remove_legacy_llm_env_overrides(text: str) -> tuple[str, tuple[str, ...]]:
     return "".join(new_lines), tuple(removed)
 
 
-def local_backend_toml_updates(env_path: Path, backend: str) -> dict[str, str]:
-    """Keep local CLI model choices when migrating dotenv settings into TOML."""
+def local_backend_toml_updates(env_path: Path, backend: str, model_id: str) -> dict[str, str]:
+    """Save the selected model and retain legacy reasoning effort in TOML."""
     validate_llm_setting("backend", backend)
+    model_id = model_id.strip()
+    if not model_id:
+        raise ConfigWizardError("Model ID must not be empty.")
     dotenv_settings = dotenv_values(env_path)
-    updates = {"backend": backend}
-    for env_key, toml_key in (("LLM_MODEL", "name"), ("LLM_EFFORT", "effort")):
-        value = dotenv_settings.get(env_key)
-        if value is not None:
-            updates[toml_key] = value
+    updates = {"backend": backend, "name": model_id}
+    effort = dotenv_settings.get("LLM_EFFORT")
+    if effort is not None:
+        updates["effort"] = effort
     for key, value in updates.items():
         validate_llm_setting(key, value)
     return updates
@@ -744,11 +788,11 @@ def apply_configuration(
     validate_input(config)
 
     env_text = _read_text_if_exists(paths.env_path)
-    toml_text = _read_text_if_exists(paths.toml_path)
-    if not toml_text:
+    if not paths.toml_path.is_file():
         raise ConfigWizardError(
             f"fm-agent.toml not found at {paths.toml_path}; refusing to guess a new project config."
         )
+    toml_text = _read_text_if_exists(paths.toml_path)
     opencode_text = _read_text_if_exists(paths.opencode_config_path)
     opencode_secret_path = secret_path_for_provider(config)
 
@@ -814,17 +858,19 @@ def _prompt_backend() -> str:
     print("  2. Auto-detect local Codex or Claude CLI")
     print("  3. Codex CLI")
     print("  4. Claude CLI")
+    print("  5. DeepSeek Harness")
     selected = _prompt("Select", "1")
     backends = {
         "1": "opencode",
         "2": "auto",
         "3": "codex-cli",
         "4": "claude-cli",
+        "5": "dsh",
     }
     try:
         return backends[selected]
     except KeyError as exc:
-        raise ConfigWizardError("Backend selection must be 1, 2, 3, or 4.") from exc
+        raise ConfigWizardError("Backend selection must be 1, 2, 3, 4, or 5.") from exc
 
 
 def prompt_for_config() -> tuple[LLMConfigInput, bool]:
@@ -868,10 +914,13 @@ def run_wizard(project_root: Path) -> int:
     backend = _prompt_backend()
     if backend != "opencode":
         print()
-        print(
-            "Local CLI backends use their own authentication; no API key or OpenCode "
-            "provider configuration is required."
-        )
+        if backend == "dsh":
+            print("Set DEEPSEEK_API_KEY in .env. For a gateway, also set DEEPSEEK_BASE_URL.")
+        else:
+            print(
+                "Local CLI backends use their own authentication; no API key or OpenCode "
+                "provider configuration is required."
+            )
         return run_local_backend_configuration(project_root, backend)
 
     paths = default_paths(project_root)
@@ -909,6 +958,7 @@ def _preview_local_backend_configuration(
         "FM-Agent local CLI backend configuration",
         "",
         f"Backend: {backend}",
+        f"Model ID: {toml_updates['name']}",
         "",
         "The following files will be updated:",
         f"  - {paths.toml_path}",
@@ -925,13 +975,13 @@ def _preview_local_backend_configuration(
         migrated = [
             f"{key}: {value!r}"
             for key, value in toml_updates.items()
-            if key in {"name", "effort"}
+            if key == "effort"
         ]
         if migrated:
             lines.extend(
                 [
                     "",
-                    "The local CLI model settings retained from .env will be written to TOML:",
+                    "The reasoning-effort setting retained from .env will be written to TOML:",
                     *[f"  - {item}" for item in migrated],
                 ]
             )
@@ -954,13 +1004,14 @@ def _preview_local_backend_configuration(
 def apply_local_backend_configuration(
     backend: str,
     paths: WizardPaths,
+    model_id: str,
 ) -> tuple[list[tuple[Path, Path | None]], tuple[str, ...]]:
-    toml_text = _read_text_if_exists(paths.toml_path)
-    if not toml_text:
+    if not paths.toml_path.is_file():
         raise ConfigWizardError(
             f"fm-agent.toml not found at {paths.toml_path}; refusing to guess a new project config."
         )
-    toml_updates = local_backend_toml_updates(paths.env_path, backend)
+    toml_text = _read_text_if_exists(paths.toml_path)
+    toml_updates = local_backend_toml_updates(paths.env_path, backend, model_id)
     updated_toml = update_llm_settings_toml_text(toml_text, toml_updates)
     try:
         tomllib.loads(updated_toml)
@@ -982,10 +1033,11 @@ def apply_local_backend_configuration(
 
 def run_local_backend_configuration(project_root: Path, backend: str) -> int:
     paths = default_paths(project_root)
+    model_id = _prompt(f"Model ID for {backend}").strip()
     _updated_env, removed_overrides = remove_legacy_llm_env_overrides(
         _read_text_if_exists(paths.env_path)
     )
-    toml_updates = local_backend_toml_updates(paths.env_path, backend)
+    toml_updates = local_backend_toml_updates(paths.env_path, backend, model_id)
     print(
         _preview_local_backend_configuration(
             backend,
@@ -1002,7 +1054,7 @@ def run_local_backend_configuration(project_root: Path, backend: str) -> int:
         print("Aborted.")
         return 1
 
-    backups, removed_overrides = apply_local_backend_configuration(backend, paths)
+    backups, removed_overrides = apply_local_backend_configuration(backend, paths, model_id)
     print(f"Updated {paths.toml_path}")
     if removed_overrides:
         print(f"Removed legacy LLM overrides from {paths.env_path}")
@@ -1040,11 +1092,11 @@ def apply_llm_settings_update(
     updates: dict[str, str],
     toml_path: Path,
 ) -> Path | None:
-    toml_text = _read_text_if_exists(toml_path)
-    if not toml_text:
+    if not toml_path.is_file():
         raise ConfigWizardError(
             f"fm-agent.toml not found at {toml_path}; refusing to guess a new project config."
         )
+    toml_text = _read_text_if_exists(toml_path)
     updated_toml = update_llm_settings_toml_text(toml_text, updates)
     try:
         tomllib.loads(updated_toml)
@@ -1096,12 +1148,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     set_parser.add_argument(
         "--backend",
         choices=_BACKENDS,
-        help="model backend: opencode, auto, codex-cli, or claude-cli",
+        help="model backend: opencode, auto, codex-cli, claude-cli, or dsh (deepseek-harness)",
     )
     set_parser.add_argument(
         "--effort",
         choices=_EFFORTS,
-        help="reasoning effort: empty, low, medium, or high",
+        help="reasoning effort supported by the selected backend (DSH: off, low, high, max)",
     )
     set_parser.add_argument(
         "--api-style",
