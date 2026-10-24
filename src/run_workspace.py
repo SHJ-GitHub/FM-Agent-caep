@@ -12,8 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
-# Also identifies the legacy archive directory inside the project.
-ARCHIVE_DIRECTORY = ".fm_agent_runs"
+ARCHIVE_SUFFIX = ".fm_agent_runs"
 RUN_METADATA = "run.json"
 
 
@@ -24,31 +23,7 @@ def _new_id() -> str:
 def archive_root(project_dir: str | Path) -> Path:
     """Keep archives beside the project, outside its source/agent scan scope."""
     project = Path(project_dir).resolve()
-    return project.with_name(project.name + ARCHIVE_DIRECTORY)
-
-
-def migrate_legacy_archives(project_dir: str | Path) -> None:
-    """Move old in-project archives out before any analysis reads the project.
-
-    Rename only; on failure all evidence remains at its old or new path and the
-    caller must stop. Never overwrite an archive already at the destination.
-    """
-    legacy = Path(project_dir).resolve() / ARCHIVE_DIRECTORY
-    if legacy.is_symlink():
-        raise ValueError(f"Archive directory must not be a symlink: {legacy}")
-    if not legacy.exists():
-        return
-    destination = archive_root(project_dir)
-    if destination.is_symlink():
-        raise ValueError(f"Archive directory must not be a symlink: {destination}")
-    destination.mkdir(exist_ok=True)
-    for source in legacy.iterdir():
-        target = destination / source.name
-        if target.exists() or target.is_symlink():
-            raise FileExistsError(f"Cannot migrate archive; destination exists: {target}")
-        source.rename(target)
-        print(f"[Pipeline] Legacy archive moved to: {target}")
-    legacy.rmdir()
+    return project.with_name(project.name + ARCHIVE_SUFFIX)
 
 
 def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = None) -> Path | None:
@@ -71,7 +46,6 @@ def archive_workspace(work_dir: str | Path, *, project_dir: str | Path | None = 
         work_dir.rmdir()
         return None
     archive_project = project_dir if project_dir else work_dir.parent
-    migrate_legacy_archives(archive_project)
     root = archive_root(archive_project)
     if root.is_symlink():
         raise ValueError(f"Archive directory must not be a symlink: {root}")
@@ -148,7 +122,7 @@ def record_run_metadata(work_dir: str | Path, project_dir: str | Path) -> dict:
         return result.stdout.strip() if result.returncode == 0 else None
 
     status = git("status", "--porcelain", "--untracked-files=normal", "--", ".",
-                 ":(exclude)fm_agent", f":(exclude){ARCHIVE_DIRECTORY}")
+                 ":(exclude)fm_agent")
     metadata = {
         "schema_version": 1,
         "run_id": _new_id(),

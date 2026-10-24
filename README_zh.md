@@ -241,7 +241,6 @@ uv run python main.py <proj_dir> --incremental intent.md --all-bugs
 `<proj_dir>.fm_agent_runs/<UTC时间戳>_<唯一ID>/`，保留报告、trace、规约、
 验证证据及续跑检查点。当前运行仍位于 `<proj_dir>/fm_agent/`，CLI 会输出
 当前路径和归档路径。归档位于项目旁边，避免 CodeGraph 和项目 Agent 扫描旧代码及报告。
-旧位置 `<proj_dir>/.fm_agent_runs/` 中的归档会在分析前迁出，续跑和增量模式也会处理。
 空工作区不归档；环境检查仅在保存用户选择的忽略警告设置时创建工作区。
 归档失败时停止分析，保留原目录。历史归档不会自动删除，
 仅在你不再需要时自行显式删除。全新的 `--isolate` 和 `--entry-func` 运行也遵循

@@ -46,7 +46,6 @@ from src.run_estimate import (
 )
 from src.run_workspace import (
     archive_workspace,
-    migrate_legacy_archives,
     publish_workspace,
     record_run_metadata,
     restore_workspace,
@@ -284,7 +283,6 @@ def run_pipeline(
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
-    migrate_legacy_archives(proj_dir)
     if not _has_source_code(proj_dir, submodules):
         scope = f" selected submodule(s): {', '.join(submodules)}" if submodules else f" {proj_dir}"
         print(f"[Pipeline] ERROR: No source code files found in{scope}. "
@@ -949,11 +947,6 @@ if __name__ == "__main__":
 
     if resume_source is not None:
         restore_workspace(resume_source, os.path.join(proj_dir, "fm_agent"))
-
-    # Restore first so --resume-from still accepts legacy in-project paths.
-    # All modes, including resume/incremental, must move these archives away
-    # before agents, source scanners, or CodeGraph see the project.
-    migrate_legacy_archives(proj_dir)
 
     # Resolve the intent path before snapshotting, since cwd-relative paths must
     # resolve against the real project, not the frozen worktree copy.

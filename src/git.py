@@ -8,8 +8,6 @@ import logging
 import tempfile
 import contextlib
 
-from src.run_workspace import ARCHIVE_DIRECTORY
-
 
 def _is_git_repo(proj_dir):
     """Return whether proj_dir is a git repository with at least one commit."""
@@ -97,10 +95,9 @@ def frozen_worktree(proj_dir, exclude=("fm_agent",), copy_excluded=True):
         # workspace dirs from the private index afterwards to cover repos that do
         # NOT gitignore them.
         _git("add", "-A", env=env)
-        snapshot_excludes = (*exclude, ARCHIVE_DIRECTORY)
-        if snapshot_excludes:
+        if exclude:
             _git("rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--",
-                 *snapshot_excludes, env=env)
+                 *exclude, env=env)
         tree = _git("write-tree", env=env)
         snap = _git("commit-tree", tree, "-p", "HEAD", "-m", "fm_agent snapshot")
         _git("worktree", "add", "--detach", wt, snap)
@@ -108,7 +105,7 @@ def frozen_worktree(proj_dir, exclude=("fm_agent",), copy_excluded=True):
         logging.info("frozen_worktree: %s is not a git repo; copying instead.", proj_dir)
         shutil.copytree(
             proj_dir, wt,
-            ignore=shutil.ignore_patterns(*exclude, ARCHIVE_DIRECTORY),
+            ignore=shutil.ignore_patterns(*exclude),
             symlinks=True,
         )
 

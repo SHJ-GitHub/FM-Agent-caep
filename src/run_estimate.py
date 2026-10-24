@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .dsh_trace import DshTraceReader
-from .run_workspace import ARCHIVE_DIRECTORY, archive_root
+from .run_workspace import archive_root
 from .extract import EXT_TO_LANG, LANG_CONFIG, extract_functions_from_file
 from .file_utils import (
     _is_test_file,
@@ -485,8 +485,6 @@ def collect_history_samples(proj_dir: str, work_dir: str | Path) -> list[dict]:
     candidates = [
         *Path(proj_dir).absolute().glob("fm_agent*"),
         *archive_root(proj_dir).glob("*"),
-        # Standalone --estimate can read old archives without migrating them.
-        *(Path(proj_dir).absolute() / ARCHIVE_DIRECTORY).glob("*"),
     ]
     for candidate in candidates:
         candidate_path = Path(candidate)

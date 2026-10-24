@@ -14,7 +14,7 @@ from src.generate_topdown_layers import (
 )
 from src.extract import EXT_TO_LANG, _function_spans, run_extraction
 from src.languages.codegraph import try_codegraph_init
-from src.run_workspace import ARCHIVE_DIRECTORY, archive_workspace, publish_workspace
+from src.run_workspace import archive_workspace, publish_workspace
 from src.file_utils import (
     _is_test_file,
     add_test_file_exemption,
@@ -360,11 +360,11 @@ def _trim_project_in_place(proj_dir, all_by_source, keep_by_source):
 # too, so a resumed run picks up where the prior one left off.
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = (".git", ARCHIVE_DIRECTORY)
+_SKIP_DIRS = (".git",)
 
 
 def _make_run_copy(proj_dir, run_dir):
-    """Copy proj_dir (except .git and archived runs) into a fresh ``run_dir``.
+    """Copy proj_dir (except .git) into a fresh ``run_dir``.
 
     Includes an existing ``fm_agent/`` workspace so a resumed pipeline finds the
     prior run's state. Any leftover run directory from an interrupted run is
@@ -395,7 +395,7 @@ def _enumerate_source_files(proj_dir):
     """
     source_files = []
     for root, dirs, files in os.walk(proj_dir):
-        dirs[:] = [d for d in dirs if d not in ("fm_agent", ".git", ARCHIVE_DIRECTORY)]
+        dirs[:] = [d for d in dirs if d not in ("fm_agent", ".git")]
         for fname in files:
             src_rel = os.path.relpath(os.path.join(root, fname), proj_dir).replace(os.sep, "/")
             ext = fname.rsplit(".", 1)[-1] if "." in fname else ""
